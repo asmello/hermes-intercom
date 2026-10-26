@@ -4,12 +4,14 @@ Every few minutes (gateway process only), look at running cards on the board.
 A card whose body names its owning session (`Session: <id>`) and has had no
 event (heartbeat, comment, edit, claim) for `stale_minutes` gets that session
 nudged over intercom: it wakes an idle session, or lands mid-turn in a busy
-one. Sessions blocked on a prompt for Andre are left alone (the nudge would
+one. Sessions blocked on a prompt for the user are left alone (the nudge would
 only queue behind the prompt). Each card is nudged at most once per
-`renudge_minutes`; nudge times persist across gateway restarts.
+`renudge_minutes`; nudge times persist across restarts.
 
 Board access goes through the `hermes kanban` CLI (a public interface), not
-the kanban DB.
+the kanban DB. The scan is skipped (no CLI spawn) while the board doesn't exist.
+One process per machine runs it (flock); if that process exits, another live
+one takes over at its next interval.
 """
 
 from __future__ import annotations
@@ -72,6 +74,18 @@ def _kanban_comment(board: str, tid: str, text: str) -> bool:
         return False
 
 
+def board_exists(board: str, home: Optional[Path] = None) -> bool:
+    try:
+        from hermes_cli.kanban_db import board_exists as _exists
+
+        return bool(_exists(board))
+    except Exception:
+        pass
+    if board == "default":
+        return (home or Path.home() / ".hermes").joinpath("kanban.db").exists()
+    return (home or Path.home() / ".hermes").joinpath("kanban", "boards", board, "board.json").exists()
+
+
 def last_card_activity(card: dict) -> float:
     task = card.get("task") or {}
     stamps = [task.get("started_at") or 0, task.get("created_at") or 0]
@@ -81,10 +95,12 @@ def last_card_activity(card: dict) -> float:
 
 
 class Watchdog:
-    def __init__(self, hub: Hub, state_path: Path, clock=time.time) -> None:
+    def __init__(self, hub: Hub, state_path: Path, clock=time.time, exists=None) -> None:
         self.hub = hub
         self.state_path = state_path
         self.clock = clock
+        self.exists = exists or (lambda board: board_exists(board, state_path.parent.parent))
+        self._missing_logged = False
 
     def _load(self) -> dict:
         try:
@@ -107,6 +123,13 @@ class Watchdog:
         list_cards = list_cards or (lambda: _kanban(board, "list", "--status", "running"))
         show_card = show_card or (lambda tid: _kanban(board, "show", tid))
         comment_card = comment_card or (lambda tid, text: _kanban_comment(board, tid, text))
+        if not self.exists(board):
+            if not self._missing_logged:
+                logger.info("intercom watchdog: board %r does not exist; idle until it does", board)
+                self._missing_logged = True
+            return []
+        self._missing_logged = False
+        user = self.hub.user
         cards = list_cards()
         if not isinstance(cards, list):
             cards = (cards or {}).get("tasks", []) if isinstance(cards, dict) else []
@@ -132,7 +155,7 @@ class Watchdog:
                 if not state.get(f"{tid}:closed") and comment_card(tid, (
                         f"[intercom watchdog] the owning session {short_id(peer.session_id)} has ended "
                         f"and the card has had no update for {int(idle_for // 60)} min: it is probably "
-                        "orphaned. Ask Andre before taking it over.")):
+                        f"orphaned. Ask {user} before taking it over.")):
                     state[f"{tid}:closed"] = now
                 continue
             if peer.state == "awaiting_input":
@@ -141,7 +164,7 @@ class Watchdog:
             text = (f"Your card {tid} on the `{board}` kanban board (\"{title}\") has had no heartbeat, "
                     f"comment or edit for {int(idle_for // 60)} min. Update it now: "
                     f"`hermes kanban --board {board} heartbeat {tid} --note \"...\"` if you are still on it, "
-                    f"`block {tid} --kind needs_input \"...\"` if you are waiting on Andre, or "
+                    f"`block {tid} --kind needs_input \"...\"` if you are waiting on {user}, or "
                     f"`complete {tid} --result \"...\"` if the work is done or abandoned.")
             try:
                 info = self.hub.send(WATCHDOG_SENDER, peer.session_id, text, kind="nudge")
@@ -156,8 +179,8 @@ class Watchdog:
 
 
 def start(hub: Hub, home: Path) -> None:
-    """Start the watchdog thread once per process, only in the gateway (one instance per machine)."""
-    if os.environ.get("HERMES_KANBAN_TASK"):  # a kanban worker process, not the gateway
+    """Start the watchdog thread once per process; only the flock holder scans (one per machine)."""
+    if os.environ.get("HERMES_KANBAN_TASK"):  # a kanban worker process
         return
     with _start_lock:  # process-global flag: a plugin reload re-imports this module
         if getattr(sys, "_hermes_intercom_watchdog_started", False):
@@ -165,21 +188,28 @@ def start(hub: Hub, home: Path) -> None:
         sys._hermes_intercom_watchdog_started = True
     lock_path = home / "intercom" / "watchdog.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "a+")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        logger.info("intercom watchdog: another process holds %s; not starting", lock_path)
-        fh.close()
-        return
     dog = Watchdog(hub, home / "intercom" / "watchdog_state.json")
+    held = {"fh": None}
+
+    def have_lock() -> bool:
+        if held["fh"] is not None:
+            return True
+        fh = open(lock_path, "a+")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        held["fh"] = fh  # kept open for the life of the process
+        logger.info("intercom watchdog: running in pid %s", os.getpid())
+        return True
 
     def loop() -> None:
-        time.sleep(60)  # let the gateway settle after start
+        time.sleep(60)  # let the process settle after start
         while True:
             try:
                 dog.hub = getattr(sys, "_hermes_intercom_hub", None) or dog.hub  # survive plugin reloads
-                if dog.hub.setting("watchdog.enabled", True):
+                if dog.hub.setting("watchdog.enabled", True) and have_lock():
                     for n in dog.tick():
                         logger.info("intercom watchdog: nudged %s about %s (%s)", short_id(n["session"]),
                                     n["card"], n.get("delivery"))
@@ -187,6 +217,4 @@ def start(hub: Hub, home: Path) -> None:
                 logger.warning("intercom watchdog: tick failed", exc_info=True)
             time.sleep(max(60.0, float(dog.hub.setting("watchdog.interval_seconds", 300))))
 
-    t = threading.Thread(target=loop, name="intercom-watchdog", daemon=True)
-    t._intercom_lock_fh = fh  # keep the flock alive with the thread
-    t.start()
+    threading.Thread(target=loop, name="intercom-watchdog", daemon=True).start()

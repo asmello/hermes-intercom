@@ -49,13 +49,20 @@ class Base(unittest.TestCase):
         self.injected = []
         self.inject_ok = True
         self.timers = []
+        self.alive = {"100:x"}
 
         def inject(text, session_key):
             self.injected.append((session_key, text))
             return self.inject_ok
 
-        self.hub = Hub(inject=inject, db_path=self.db, log_path=Path(self.tmp.name) / "log.jsonl",
-                       clock=lambda: self.now, schedule=lambda d, fn: self.timers.append(fn))
+        self.hub = self.make_hub(inject, token="100:x", schedule=lambda d, fn: self.timers.append(fn))
+
+    def make_hub(self, inject, token, **kw):
+        kw.setdefault("schedule", lambda d, fn: None)
+        return Hub(inject=inject, db_path=self.db, log_path=Path(self.tmp.name) / "log.jsonl",
+                   clock=lambda: self.now, store_path=Path(self.tmp.name) / "intercom.db",
+                   run_dir=Path(self.tmp.name) / "run", token=token, alive=lambda t: t in self.alive,
+                   poll_wait=0.02, **kw)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -82,7 +89,7 @@ class DeliveryTests(Base):
         self.assertIn("queued as a new turn", info["delivery"])
         key, text = self.injected[0]
         self.assertEqual(key, f"agent:main:local:dm:{B}")
-        self.assertIn("NOT from Andre", text)
+        self.assertIn("NOT from the user", text)
         self.assertIn('"Alpha work"', text)
         self.hub.on_turn_start(B, text)
         log = [json.loads(x) for x in (Path(self.tmp.name) / "log.jsonl").read_text().splitlines()]
@@ -93,7 +100,7 @@ class DeliveryTests(Base):
         info = self.hub.send(A, B, "hello")
         self.assertEqual([k for k, _ in self.injected], [f"agent:main:local:dm:{B}", B])
         self.assertIn("held", info["delivery"])
-        ctx = self.hub.on_turn_start(B, "andre typed something")
+        ctx = self.hub.on_turn_start(B, "the user typed something")
         self.assertIn("hello", ctx)
 
     def test_running_target_gets_message_in_next_tool_result(self):
@@ -183,17 +190,21 @@ class AskReplyTests(Base):
         with self.assertRaises(IntercomError) as cm:
             self.hub.ask(B, A, "q2", timeout_s=5)
         self.assertIn("waiting for YOUR answer", str(cm.exception))
+        rid = self.hub.status(B)["questions_for_you"][0]["request_id"]
+        self.hub.reply(B, rid, "unblock")
+        t.join(5)
 
 
 class PersistenceTests(Base):
     def test_held_messages_and_async_questions_survive_restart(self):
-        spool = Path(self.tmp.name) / "spool.json"
-        hub = Hub(inject=lambda *a, **k: False, db_path=self.db, clock=lambda: self.now, spool_path=spool,
-                  schedule=lambda d, fn: None)
+        self.alive.add("200:old")
+        hub = self.make_hub(lambda *a, **k: False, token="200:old")
         hub.on_input_request(B, "clarify", "?")
         info = hub.ask(A, B, "still there?", timeout_s=60)
         self.assertEqual(info["status"], "pending")
-        hub2 = Hub(inject=lambda *a, **k: True, db_path=self.db, clock=lambda: self.now, spool_path=spool)
+        self.alive.discard("200:old")  # that process died
+        hub2 = self.make_hub(lambda *a, **k: True, token="201:new")
+        self.alive.add("201:new")
         self.assertIn("still there?", hub2.on_turn_start(B, "resumed"))
         hub2.on_turn_end(A)
         self.assertIn("queued", hub2.reply(B, info["request_id"], "yes")["delivery"])
@@ -201,9 +212,92 @@ class PersistenceTests(Base):
     def test_adopt_keeps_state(self):
         self.hub.on_turn_start(B, "w")
         self.hub.send(A, B, "carry over")
-        new = Hub(inject=lambda *a, **k: True, db_path=self.db, clock=lambda: self.now)
+        new = self.make_hub(lambda *a, **k: True, token="100:x")
         new.adopt(self.hub)
         self.assertIn("carry over", new.on_tool_result(B, "r"))
+
+
+class CrossProcessTests(Base):
+    """Two hubs = two Hermes processes (e.g. gateway + Desktop serve) sharing mailbox and presence."""
+
+    def setUp(self):
+        super().setUp()
+        self.y_injected = []
+        self.alive.add("300:y")
+
+        def y_inject(text, session_key):  # process Y hosts nothing here
+            self.y_injected.append((session_key, text))
+            return False
+
+        self.y = self.make_hub(y_inject, token="300:y")
+
+    def test_idle_target_in_other_process_is_relayed_by_its_poller(self):
+        self.hub.on_turn_start(B, "w")
+        self.hub.on_turn_end(B)
+        self.timers.clear()
+        info = self.y.send(A, B, "over the wall")
+        self.assertIn("relayed", info["delivery"])
+        self.assertEqual(self.y_injected, [])
+        self.hub.poll_once()
+        self.assertEqual(len(self.injected), 1)
+        self.assertIn("over the wall", self.injected[0][1])
+        self.hub.poll_once()
+        self.assertEqual(len(self.injected), 1)
+
+    def test_running_target_in_other_process_gets_it_mid_turn(self):
+        self.hub.on_turn_start(B, "w")
+        self.assertIsNone(self.hub.on_tool_result(B, "r0"))  # primes the cache
+        info = self.y.send(A, B, "ping")
+        self.assertEqual(info["target_state"], "running")
+        self.assertIn("ping", self.hub.on_tool_result(B, "r1"))
+
+    def test_unhosted_target_is_tried_once_by_each_process(self):
+        info = self.y.send(A, B, "anyone?")
+        self.assertIn("not loaded", info["delivery"])
+        self.assertEqual(len(self.y_injected), 2)  # route key, then id
+        self.y.poll_once()
+        self.assertEqual(len(self.y_injected), 2)  # Y already tried
+        self.hub.poll_once()  # X hosts it after all (window open, no turn yet)
+        self.assertEqual(len(self.injected), 1)
+        self.assertIn("anyone?", self.injected[0][1])
+
+    def test_dead_owner_is_ignored(self):
+        self.hub.on_turn_start(B, "w")
+        self.hub.on_turn_end(B)
+        self.alive.discard("100:x")
+        info = self.y.send(A, B, "hello?")
+        self.assertEqual(info["target_state"], "unknown")
+        self.assertIn("not loaded", info["delivery"])
+
+    def test_ask_and_reply_across_processes(self):
+        self.hub.on_turn_start(B, "w")
+        result = {}
+        t = threading.Thread(target=lambda: result.update(self.y.ask(A, B, "done yet?", timeout_s=10)))
+        t.start()
+        delivered = None
+        for _ in range(200):
+            delivered = self.hub.on_tool_result(B, "r")
+            if delivered:
+                break
+            time.sleep(0.02)
+        rid = delivered.split("request_id: ")[1].split()[0]
+        self.assertEqual(self.hub.reply(B, rid, "yes")["status"], "delivered")
+        t.join(5)
+        self.assertEqual(result["answer"], "yes")
+
+    def test_reply_to_dead_asker_becomes_a_message(self):
+        self.alive.add("400:z")
+        z = self.make_hub(lambda *a, **k: False, token="400:z")
+        z.store.add_waiter("req_dead", A, B, "q", self.now, "400:z")
+        self.alive.discard("400:z")
+        out = self.hub.reply(B, "req_dead", "answer for a ghost")
+        self.assertIn("delivery", out)
+
+    def test_presence_is_shared(self):
+        self.hub.on_input_request(B, "clarify", "Which branch?")
+        p = self.y.peer(B)
+        self.assertEqual(p.state, "awaiting_input")
+        self.assertEqual(p.owner, "100:x")
 
 
 class WatchdogTests(Base):
@@ -212,8 +306,15 @@ class WatchdogTests(Base):
                          "started_at": last - 5},
                 "events": [{"kind": "heartbeat", "created_at": last}], "comments": []}
 
+    def dog(self):
+        return Watchdog(self.hub, Path(self.tmp.name) / "wd.json", clock=lambda: self.now, exists=lambda b: True)
+
+    def test_missing_board_is_not_scanned(self):
+        dog = Watchdog(self.hub, Path(self.tmp.name) / "wd.json", clock=lambda: self.now, exists=lambda b: False)
+        self.assertEqual(dog.tick(lambda: self.fail("listed a missing board"), None), [])
+
     def test_nudges_stale_card_once(self):
-        dog = Watchdog(self.hub, Path(self.tmp.name) / "wd.json", clock=lambda: self.now)
+        dog = self.dog()
         cards = {"t_1": self.card("t_1", B, self.now - 4000), "t_2": self.card("t_2", A, self.now - 100)}
         sent = dog.tick(lambda: [{"id": k} for k in cards], lambda tid: cards[tid])
         self.assertEqual([s["card"] for s in sent], ["t_1"])
@@ -221,15 +322,15 @@ class WatchdogTests(Base):
         self.assertIn("watchdog", self.injected[0][1])
         self.assertEqual(dog.tick(lambda: [{"id": k} for k in cards], lambda tid: cards[tid]), [])
 
-    def test_skips_session_waiting_on_andre(self):
+    def test_skips_session_waiting_on_user(self):
         self.hub.on_input_request(B, "clarify", "?")
-        dog = Watchdog(self.hub, Path(self.tmp.name) / "wd.json", clock=lambda: self.now)
+        dog = self.dog()
         cards = {"t_1": self.card("t_1", B, self.now - 4000)}
         self.assertEqual(dog.tick(lambda: [{"id": "t_1"}], lambda tid: cards[tid]), [])
 
     def test_closed_session_gets_one_card_comment_instead_of_nudge(self):
         self.hub.on_closed(B)
-        dog = Watchdog(self.hub, Path(self.tmp.name) / "wd.json", clock=lambda: self.now)
+        dog = self.dog()
         cards = {"t_1": self.card("t_1", B, self.now - 4000)}
         comments = []
         tick = lambda: dog.tick(lambda: [{"id": "t_1"}], lambda tid: cards[tid],
@@ -241,7 +342,7 @@ class WatchdogTests(Base):
         self.assertEqual(self.injected, [])
 
     def test_follows_compaction_from_card_session(self):
-        dog = Watchdog(self.hub, Path(self.tmp.name) / "wd.json", clock=lambda: self.now)
+        dog = self.dog()
         cards = {"t_3": self.card("t_3", C, self.now - 4000)}
         sent = dog.tick(lambda: [{"id": "t_3"}], lambda tid: cards[tid])
         self.assertEqual(sent[0]["session"], "local-cccc4444")
