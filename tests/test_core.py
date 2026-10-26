@@ -293,6 +293,13 @@ class CrossProcessTests(Base):
         out = self.hub.reply(B, "req_dead", "answer for a ghost")
         self.assertIn("delivery", out)
 
+    def test_hosts_only_covers_sessions_seen_here(self):
+        self.hub.on_turn_start(B, "w", session_key="route-b")
+        self.assertTrue(self.hub.hosts(B))
+        self.assertTrue(self.hub.hosts("route-b"))
+        self.assertFalse(self.hub.hosts(A))
+        self.assertFalse(self.y.hosts(B))
+
     def test_presence_is_shared(self):
         self.hub.on_input_request(B, "clarify", "Which branch?")
         p = self.y.peer(B)

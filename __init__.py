@@ -358,6 +358,12 @@ def register(ctx):
         return ctx.get_config(key, default)
 
     def inject(text, session_key):
+        # The classic CLI host queues ANY injected text into its own prompt, whatever session_key says
+        # (hermes_cli/plugins_injection.py). Only let it through for a session this process hosts, so
+        # mail for other sessions can't leak into the CLI's conversation.
+        manager = getattr(ctx, "_manager", None)
+        if getattr(manager, "_cli_ref", None) is not None and not (_hub and _hub.hosts(session_key)):
+            return False
         return ctx.inject_message(text, role="user", session_key=session_key)
 
     hub = Hub(inject=inject, db_path=db, log_path=log, settings=settings,

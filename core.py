@@ -610,6 +610,14 @@ class Hub:
             snapshot = Peer(**vars(p))
         self._write_presence(snapshot)
 
+    def hosts(self, key: str) -> bool:
+        """True if *key* (session id or route key) names a session hook-observed in this process."""
+        if not key:
+            return False
+        with self._lock:
+            return any(key in (sid, p.session_key) for sid, p in self._local.items()
+                       if p.state != "closed")
+
     def is_local(self, session_id: str) -> bool:
         with self._lock:
             return self.canonical(session_id) in self._local
