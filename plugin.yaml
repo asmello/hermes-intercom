@@ -1,0 +1,16 @@
+name: intercom
+version: 0.1.0
+description: "Session-to-session messaging for local Hermes sessions (CLI/TUI/Desktop): discover live peers, send messages, ask questions and get replies, plus a watchdog that nudges sessions whose `sessions` kanban card has gone stale. Uses only the public plugin API (register_tool, hooks, inject_message)."
+author: "Andre (asmello) + Hermes"
+provides_tools:
+  - intercom
+provides_hooks:
+  - pre_llm_call
+  - transform_tool_result
+  - on_session_end
+  - on_session_finalize
+  - on_session_delete
+  - post_compaction
+  - on_human_input_request
+  - on_human_input_resolved
+  - subagent_start
