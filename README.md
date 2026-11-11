@@ -1,4 +1,4 @@
-# intercom — session-to-session messaging for local Hermes sessions
+# intercom — messaging and sequencing between local Hermes sessions
 
 User plugin (`~/.hermes/plugins/intercom`, outside the Hermes checkout, so `hermes update` never touches it).
 Sessions can live in several Hermes processes at once (the messaging gateway, a Desktop `serve` process per
@@ -7,7 +7,7 @@ needs no sockets or daemons, but keeps its shared state outside process memory:
 
 | what | where | written |
 |---|---|---|
-| mailbox: messages + ask/reply waiters (SQLite) | `~/.hermes/intercom/intercom.db` | once per message |
+| mailbox: messages, ask/reply waiters, registered waits (SQLite) | `~/.hermes/intercom/intercom.db` | once per message or wait |
 | presence: state of each hosted session + owning process | `/run/user/<uid>/hermes-intercom-<hash>/presence/` (tmpfs; falls back to `~/.hermes/intercom/run`) | per turn / prompt |
 | audit log | `~/.hermes/intercom/messages.jsonl` | per delivery event |
 
@@ -19,13 +19,80 @@ is what makes trying from the wrong process safe.
 ## Tool: `intercom`
 | action | does |
 |---|---|
-| `list` | recent interactive sessions: title, state (`running` / `idle` / `awaiting_input` + the prompt / `unknown`), cwd, branch, last activity |
+| `list` | recent interactive sessions: id, short id, title, state (`running` / `idle` / `awaiting_input` + the prompt / `unknown`), who they wait for, cwd, branch, last activity |
 | `send to= message=` | one-way message |
 | `ask to= message= timeout_s=` | question; blocks up to `timeout_s` (≤360) for the answer, else `no_reply_yet` and the late answer arrives as a message |
-| `reply request_id= message=` | answer a question |
-| `status` | own id, open questions both ways |
+| `reply [request_id=] message=` | answer a question; `request_id` may be left out when it can only mean one question (below) |
+| `wait to= [timeout_s=] [message=] [cancel=]` | block until session `to` yields (see below) |
+| `status` | own id, open questions both ways, who the caller waits for and who waits for it |
 
-`to` = full id, id prefix (≥4 chars) or words from the title.
+`to` = the full id, any 4+ characters of it (the short id shown by `list`, a prefix, the start time in the
+middle) or words from the title, each matched from the start of a title word. The short id is the random
+suffix of Hermes's `YYYYMMDD_HHMMSS_xxxxxx` ids: their first eight characters are the date, shared by every
+session started that day. A `to` that fits several sessions, by id or by title, is refused with the
+candidates listed. A `to` shaped like an id is matched against ids only: a title is written from what the
+session read, so it can quote another session's id.
+
+`reply` without `request_id` answers the caller's only open question if its asker is still blocked in the
+call, or if it was asked in the last 15 minutes and no other session has written to the caller since.
+Otherwise it is refused with the open questions listed: an old question must not collect an answer meant
+for a later message. Only the session a question was put to can answer it.
+
+A call that fails on addressing (no `to`, an ambiguous or unknown `to`, a missing or unknown `request_id`)
+says what would work: the sessions the caller recently exchanged messages with, or the questions waiting
+for its answer. The message text of that call is kept for five minutes, so a retry of the same action can
+add the missing field and leave `message` out; the result says which text was sent. What a refused `reply`
+wrote can also go out with `send` (a reply to something that was not a question is a send); nothing else
+crosses from one action to another. A message longer than 8000 characters is cut, and the sender is told.
+
+## Waiting for a session to yield
+`wait` is for sequencing: the caller's next step depends on another session's work, or must come after
+it. A session has **yielded** when no turn is running in it and nothing is about to start one. Two
+witnesses are read: what the session's host reported through the hooks (turn start and end, prompts), and
+Hermes's own turn lease, the `state.db` row it keeps from before a turn's first hook until after its last,
+on every way out of the turn. A session has yielded when
+
+- its turn ended at least `settle_seconds` ago (a queued user message or held intercom mail starts the
+  next turn within that window), and it has no undelivered intercom mail;
+- Hermes holds no turn lease for it (it does for a turn it has accepted but whose host has not reported it
+  yet, e.g. while the context is compacted before the first model call);
+- it has no background subagents running or waiting to hand their results back (Hermes re-enters the
+  session with them);
+- it is not itself registered as waiting for another session (it ended its turn only to be resumed).
+
+Hermes drops some failed turns (an API error it gives up on) without the end-of-turn hook. Such a turn is
+recognised by its lease being gone: the session is shown as idle again, mail held for it is delivered, and
+a waiter gets `turn: unreported`.
+
+A session no live process hosts (never ran since its process started, closed, or its process exited)
+counts as yielded, and the result says which. Whatever cannot be read at that moment (a presence file,
+the mailbox, `state.db`) counts as "not yielded": not knowing is never reported as a yield. Background
+terminal processes with `notify` are not visible to the plugin: a session that ended its turn to wait for
+one looks yielded, which is one reason the result carries the session's final message.
+
+What the caller gets, whichever comes first:
+
+| `status` | when | registered afterwards |
+|---|---|---|
+| `yielded` | the target yielded: `note` (how), `turn` (`completed` / `interrupted` / `failed` / `incomplete` = out of steps / `unreported`), `final_message` + `final_message_age` (the start of the last thing it said in that turn) | no |
+| `message_arrived` | an intercom message for the caller arrived; it is appended to the result as usual | no if it is from the target (it has spoken), otherwise yes |
+| `interrupted` | the user stopped the caller, or sent it a message mid-turn | no after a stop, yes after a message |
+| `not_yielded_yet` | `timeout_s` passed (default 240, max 360; `0` = don't block); `pending` says what the target is doing | yes |
+
+While **registered**, the caller is told by an intercom message when the target yields, which wakes it if
+it is idle. So a long wait costs nothing: the caller ends its turn and is resumed. (Blocking again instead
+would re-read the whole conversation at every timeout; the default stays under the 5-minute prompt-cache
+window for that reason.) A registration ends when it fires, with `cancel=true`, when the waiter's session
+is deleted, or after `wait_max_hours` (the waiter is told). A waiter that Hermes only unloads or archives
+(its window was closed, its client went away) keeps its registration: the notice is held like any other
+mail and read when the session is opened again. Subagents and sessions on surfaces that cannot be woken (cron runs) are
+never left registered.
+
+The target is told once, at its next tool result or turn start and never by waking it, that the caller is
+waiting, with the optional `message` as the reason, so it can release what the caller needs before its
+turn ends (`send` to a waiter that is blocking returns its `wait` at once). A wait that could never end is
+refused: the target waits for the caller (directly or through other sessions), or is blocked asking it a
+question. Of two sessions that register on each other at the same moment, one is refused.
 
 ## Delivery
 - idle target in the same process → injected as a new turn (wakes it; FIFO, never interrupts)
@@ -36,11 +103,21 @@ is what makes trying from the wrong process safe.
 - target not hosted by any process that has seen it run → every live process tries to inject it once (covers
   a window that's open but hasn't run a turn since its process started); otherwise held until the session's
   next turn, in whichever process runs it. Held messages survive restarts and reboots (7-day retention).
+- target unloaded by Hermes (its window was closed) → held until its next turn; the sender is told
 - `ask` works across processes: the asker polls the mailbox for the reply; a reply to an asker whose process
   has died is delivered as a normal message instead.
+- `ask` and `wait` stop blocking when the user stops the session or sends it a message mid-turn.
 
 Messages are framed `[INTERCOM — message from another agent session, NOT from <user_name>]` and told they carry
-no user authority. `/intercom` and `/intercom log [N]` in any session.
+no user authority. Everything that came from another session is untrusted, because sessions read web pages
+and mail: message bodies, titles, prompts, the final message `wait` quotes, and whatever is in the shared
+mailbox, which is a file of the user's. Bodies and quoted transcripts are shown as `> ` quoted lines, so
+nothing in them can close the frame or open another; wherever such text opens one of Hermes's own control
+frames (`[OUT-OF-BAND USER MESSAGE`, `[System note:` and the rest of Hermes's list, read at load) or an
+`[INTERCOM` frame, the opener is relabelled `[peer-quoted ...`; a title or prompt shown in quotes cannot
+close them; and an id read back from the mailbox is shown as a quoted scrap unless it has the shape of one.
+
+`/intercom` and `/intercom log [N]` in any session.
 
 ## Stale-card watchdog
 In one process per machine (flock; another live process takes over if it exits), every `interval_seconds`:
@@ -61,14 +138,26 @@ without spawning the kanban CLI; create it with `hermes kanban boards create ses
 - `settings.watchdog.enabled` (default true), `.board` (`sessions`), `.stale_minutes` (60),
   `.renudge_minutes` (60), `.interval_seconds` (300)
 - `settings.list_window_hours` (24), `settings.inject_key_order` (`[route, id]`)
+- `settings.settle_seconds` (5) — how long a session must have been idle before it counts as yielded;
+  `settings.wait_max_hours` (24) — how long a registered wait is kept
 
 ## Update safety
 Only documented surfaces: `register_tool/hook/command/cli_command`, `inject_message`, `get_config`, the hook
-payloads in the hooks catalog, `gateway.session_context.get_session_env` / `bound_session_key`. `state.db` and the kanban CLI are read
-defensively (listing degrades, nothing crashes). The seam check runs at every load, logs a warning and pops a
-desktop notification (macOS, or `notify-send` on a Linux desktop) once per new problem set; run
-`hermes intercom doctor` after an update to check by hand.
+payloads in the hooks catalog, `gateway.session_context.get_session_env` / `bound_session_key`. `state.db`
+(session titles; for `wait`, the transcript, the turn leases and the background-delegation table), the
+kanban CLI and board reader, `tools.interrupt` (user stop / mid-turn message during a blocking call) and
+Hermes's list of control-frame openers are read defensively: listing degrades, a wait reports less or runs to its timeout,
+the plugin's own copy of the list is used, nothing crashes. The seam check runs at every load, logs a
+warning and pops a desktop notification (macOS, or `notify-send` on a Linux desktop) once per new problem
+set; run `hermes intercom doctor` after an update to check by hand.
 
-Tests: `cd ~/.hermes/plugins && python3 -m unittest intercom.tests.test_core`
+`ask` and `wait` block for at most 360 s, inside Hermes's default tool deadline (420 s). With a lower
+deadline configured (`timeouts.tools.sequential_call`), Hermes abandons the call first: the caller gets a
+tool timeout instead of the outcome, and a `wait` is then dropped rather than left registered. Keep
+`timeout_s` below the configured deadline.
+
+Tests: `cd ~/.hermes/plugins && python3 -m unittest discover -s intercom/tests -t .` (`test_core`: the logic
+with a fake clock; `test_plugin`: the tool handler and hook adapters; `test_processes`: `wait` across real
+OS processes sharing one mailbox)
 Reload after editing: `hermes plugins disable intercom && hermes plugins enable intercom` (hooks reload live;
 the tool's new code reaches new sessions; state carries over).
