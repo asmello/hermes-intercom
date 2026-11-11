@@ -159,5 +159,8 @@ tool timeout instead of the outcome, and a `wait` is then dropped rather than le
 Tests: `cd ~/.hermes/plugins && python3 -m unittest discover -s intercom/tests -t .` (`test_core`: the logic
 with a fake clock; `test_plugin`: the tool handler and hook adapters; `test_processes`: `wait` across real
 OS processes sharing one mailbox)
-Reload after editing: `hermes plugins disable intercom && hermes plugins enable intercom` (hooks reload live;
-the tool's new code reaches new sessions; state carries over).
+Reload after editing, without restarting anything: `hermes plugins update intercom` on a tracking branch, or
+`hermes_cli.plugins_activation.activate_plugin_now("intercom", in_process=False)` under the interpreter Hermes
+runs. Either one unloads and reloads every plugin of the Desktop backend and the gateway: the handler, hooks
+and commands are live at once, the tool's description waits for the next session, and the new hub takes over
+the running one's state. Drop the `__pycache__` directories first.
