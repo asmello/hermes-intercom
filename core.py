@@ -29,8 +29,10 @@ Delivery model:
 * target blocked on a human prompt -> held as for running; it lands in the
   prompt's tool result once the prompt resolves or times out
 * target not hosted anywhere known -> every live process tries to inject it once
-  (hosts refuse sessions they don't own); otherwise it waits for the session's
-  next turn, whichever process runs it
+  (hosts refuse sessions they don't own; a chat session only the messaging
+  gateway can start). The sender's call watches the message for
+  ``relay_wait_seconds`` and reports whether another process took it; otherwise
+  it waits for the session's next turn, whichever process runs it
 
 Waiting (``wait``): a session has *yielded* when no turn is running in it and
 nothing is about to start one: it has been idle for ``settle_seconds``, Hermes
@@ -52,6 +54,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -343,6 +346,21 @@ class Mailbox:
             return [self._msg(r) for r in c.execute(
                 "SELECT * FROM messages WHERE target_id=? AND status='injected'", (target_id,))]
 
+    def question_sent(self, rid: str) -> bool:
+        """Was the question message of request *rid* stored (so its target can see it)?"""
+        with self._conn() as c:
+            return c.execute("SELECT 1 FROM messages WHERE request_id=? AND kind='question' LIMIT 1",
+                             (rid,)).fetchone() is not None
+
+    def status_of(self, mid: str) -> Optional[tuple[str, list]]:
+        """(status, tokens of the processes that tried to start a turn with it), or None if it is gone."""
+        with self._conn() as c:
+            row = c.execute("SELECT status, tried FROM messages WHERE mid=?", (mid,)).fetchone()
+        if not row:
+            return None
+        tried = json.loads(row[1] or "[]")  # ValueError if another writer left it malformed
+        return str(row[0]), [str(t) for t in tried] if isinstance(tried, list) else []
+
     def contacts(self, session_id: str, since: float) -> list[str]:
         """Ids *session_id* exchanged messages with since *since*, most recent first."""
         with self._conn() as c:
@@ -623,7 +641,7 @@ class Hub:
     def _number(self, key: str, default: float) -> float:
         try:
             return float(self.setting(key, default))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return float(default)
 
     @property
@@ -819,7 +837,14 @@ class Hub:
 
     def _db_sessions(self, window_hours: float, ids: tuple[str, ...] = ()) -> Optional[dict[str, dict]]:
         """Recent targetable sessions from state.db, plus those of *ids* whatever their age ({} = none);
-        None if the schema/file is unusable."""
+        None if the schema/file is unusable.
+
+        A session from a non-local source with no reply from the agent is left out of the recent ones:
+        Hermes seeds such a row for every thread a cron delivery opens, with the brief as its only
+        message. It is nobody's conversation, and waking it would post into that thread. Once the
+        user answers there and a turn replies, it is listed; so is a session that replaced a compacted
+        one. Sessions in *ids* (live ones) are always kept. Without a readable transcript table every
+        session is listed, as before this filter."""
         conn = self._db_or_none()
         if conn is None:
             return None
@@ -833,8 +858,16 @@ class Hub:
             activity = "COALESCE(last_activity_at, started_at)" if "last_activity_at" in cols else "started_at"
             sources = self.sources()
             select = f"SELECT {', '.join(want)} FROM sessions WHERE source IN ({','.join('?' * len(sources))}) AND "
-            out = {r["id"]: dict(r) for r in conn.execute(
-                select + f"{activity} >= ?", [*sources, self._clock() - window_hours * 3600])}
+            recent, params = f"{activity} >= ?", [*sources, self._clock() - window_hours * 3600]
+            if {"session_id", "role"} <= {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}:
+                # A session that replaced a compacted one carries on that conversation: kept too.
+                compacted = (" OR EXISTS (SELECT 1 FROM sessions p WHERE p.id = sessions.parent_session_id "
+                             "AND p.end_reason = 'compression')" if {"parent_session_id", "end_reason"} <= cols
+                             else "")
+                recent += (f" AND (source IN ({','.join('?' * len(LOCAL_SOURCES))}) OR EXISTS (SELECT 1 FROM "
+                           f"messages m WHERE m.session_id = sessions.id AND m.role = 'assistant'){compacted})")
+                params += LOCAL_SOURCES
+            out = {r["id"]: dict(r) for r in conn.execute(select + recent, params)}
             for i in range(0, len(ids), ID_CHUNK):
                 chunk = [sid for sid in ids[i:i + ID_CHUNK] if sid not in out]
                 if chunk:
@@ -883,15 +916,32 @@ class Hub:
         return sorted(out.values(), key=lambda p: -p.last_activity)
 
     def peer(self, session_id: str) -> Peer:
+        """*session_id*'s directory entry, looked up as far back as `resolve` addresses sessions.
+        Outside the directory: this process's own record of a session it hosts; else, for a session
+        from a messaging source, an entry with no route key, since an old record's key would wake
+        it (closed for one nobody replied in, e.g. a cron delivery thread); else a presence record."""
         sid = self.canonical(session_id)
-        for p in self.peers():
+        for p in self.peers(window_hours=max(24.0 * 14, self._number("list_window_hours", 24))):
             if p.session_id == sid:
                 return p
-        with self._lock:
+        with self._lock:  # on_closed drops a session from _local: what is left there runs here
             local = self._local.get(sid)
             if local:
-                return Peer(**vars(local))
-        return self._presence_all().get(sid) or Peer(session_id=sid)
+                return Peer(**vars(local))  # e.g. a gateway chat whose source is not listed
+        source = self._db_source(sid)
+        if source and source not in LOCAL_SOURCES:
+            # No route key either way. A chat with a conversation in it may be run by another process
+            # (the gateway, for a platform not in `sources`): its poller can deliver, so the sender
+            # waits for that. One nobody replied in (a cron delivery thread) is left alone.
+            replied = self._db_one("SELECT 1 FROM messages WHERE session_id = ? AND role = 'assistant' LIMIT 1",
+                                   (sid,))
+            return Peer(session_id=sid, source=source, state="unknown" if replied else "closed")
+        return self._presence_all().get(sid) or Peer(session_id=sid, source=source)
+
+    def _db_source(self, session_id: str) -> str:
+        """state.db's `source` for *session_id* ("" when it has no row or cannot be read)."""
+        row = self._db_one("SELECT source FROM sessions WHERE id = ?", (session_id,))
+        return str(row[0] or "") if row else ""
 
     def resolve(self, to: str, *, caller_id: str) -> Peer:
         needle = (to or "").strip()
@@ -1274,7 +1324,13 @@ class Hub:
         """Inject *text* into *peer*; returns the key that worked, or None."""
         order = self.setting("inject_key_order", ["route", "id"])
         keys = []
+        # A messaging session is started by its route key only: the gateway accepts a key it does not
+        # know (a bare session id) and drops the turn later, so the mail would pass for delivered.
+        kind = peer.source or peer.platform  # the hooks name the platform when state.db could not be read
+        by_id = not kind or kind in LOCAL_SOURCES
         for which in order if isinstance(order, list) else ["route", "id"]:
+            if which == "id" and not by_id:
+                continue
             k = peer.session_key if which == "route" else peer.session_id
             if k and k not in keys:
                 keys.append(k)
@@ -1301,6 +1357,15 @@ class Hub:
         return bool(key)
 
     def deliver(self, m: Message) -> dict:
+        return self._deliver(m)[0]
+
+    def _deliver(self, m: Message, until: Optional[float] = None) -> tuple[dict, str, str]:
+        """Store and deliver *m*. Returns what the sender is shown; how it went: "queued" (a turn was
+        started here), "busy" (held for a running or blocked target), "host" (left to the live process
+        hosting the target), "relayed" (another process started a turn with it), "relaying" (another
+        process was starting one when the window closed) or "held" (nobody could); and the stop
+        signal consumed while waiting for a relay ("" = none), which the caller must act on.
+        *until* (time.monotonic()) cuts that wait short: a blocking caller's own deadline."""
         peer = self.peer(m.target_id)
         m.target_id = peer.session_id
         info = {"to": self.label(peer.session_id), "message_id": m.mid, "target_state": peer.state}
@@ -1324,14 +1389,91 @@ class Hub:
             info["delivery"] = ("held: lands at the target's next tool result or turn boundary" if busy else
                                 "relayed to the Hermes process hosting the target; it starts a turn there "
                                 "within a few seconds")
-            return info
+            return info, "busy" if busy else "host", ""
         if self._inject_claimed(peer, [m]):
             info["delivery"] = "queued as a new turn on the target (wakes it if idle)"
-            return info
+            return info, "queued", ""
         self._log("held", m)
-        info["delivery"] = ("target session is not loaded in any running Hermes process; held until its next "
-                            f"turn (e.g. when {self.user} reopens it)")
-        return info
+        if mine or peer.state == "closed":
+            # Hosted here (this process's own hooks or poller deliver it), or unloaded by its host (no
+            # poller starts a closed session): nobody else will take it, so don't wait for that.
+            info["delivery"] = self._held_text()
+            return info, "held", ""
+        # This process cannot start a turn in it, but another one may: a chat session can only be
+        # started by the messaging gateway, a window open in another Desktop connection only by that
+        # connection's backend. Their pollers try held mail within a tick; give them that long.
+        outcome, tried, waited, signal, status = self._await_relay(m.mid, until)
+        if outcome == "relayed" and status.startswith("delivered_"):
+            info["delivery"] = "it reached the session in a turn that started meanwhile"
+        elif outcome == "relayed":
+            info["delivery"] = ("another Hermes process started a turn with it (e.g. the messaging gateway, "
+                                "for a chat session)")
+        elif outcome == "relaying":
+            info["delivery"] = ("another Hermes process is starting a turn with it (e.g. the messaging "
+                                "gateway, for a chat session)")
+            if signal:
+                info["delivery"] += (f"; stopped waiting for it after {waited:.1f} s because {self.user} "
+                                     "stopped or messaged you")
+        else:
+            info["delivery"] = self._held_text(waited, len([t for t in tried if t != self.token]), signal)
+        return info, outcome, signal
+
+    def _held_text(self, waited: Optional[float] = None, others: int = 0, signal: str = "") -> str:
+        """What the sender is told about mail nobody could start a turn with. *waited*: how long it
+        watched for another process to take it (None = it did not); *signal*: what cut that short."""
+        if waited is None:
+            how = ""
+        elif signal:
+            how = (f" (stopped waiting after {waited:.1f} s because {self.user} stopped or messaged you; "
+                   "another process may still start it)")
+        else:
+            how = f" (none started a turn with it within {waited:.1f} s; {others} other process(es) tried)"
+        return (f"target session is not loaded in any running Hermes process{how}; held until its next turn "
+                f"(e.g. when {self.user} reopens it)")
+
+    def _relay_window(self) -> float:
+        """How long a sender watches for another process to take its mail: `relay_wait_seconds`, by
+        default one poller tick plus a margin, never negative, never over 30 s, never NaN."""
+        poll = self._number("poll_seconds", 3)
+        window = self._number("relay_wait_seconds", poll + 2)
+        if math.isnan(window):  # also what a NaN poll_seconds gives
+            window = (3.0 if math.isnan(poll) else poll) + 2
+        return min(max(window, 0.0), 30.0)
+
+    def _await_relay(self, mid: str, until: Optional[float] = None) -> tuple[str, list, float, str, str]:
+        """Watch held message *mid* while the other processes' pollers try it, for the relay window
+        or until *until*, whichever is first. Returns ("relayed" | "relaying" | "held", the tokens
+        that tried it, the seconds waited, the stop signal that ended it early or "", the last status
+        read). A status that cannot be read is no news: the last one read stands, and a window that
+        ends on "held" reads as nobody took it. The signal is consumed here (Hermes reports a
+        mid-turn message once): `ask` acts on it, the others report it in the delivery text."""
+        started = time.monotonic()
+        deadline = started + self._relay_window()
+        if until is not None:
+            deadline = min(deadline, until)
+        status, tried = "held", []
+        while True:
+            row = self._status_of(mid)
+            if row is not None:
+                status, tried = row
+            waited = time.monotonic() - started
+            if status not in ("held", "injecting"):
+                return "relayed", tried, waited, "", status
+            done = "relaying" if status == "injecting" else "held"
+            if time.monotonic() >= deadline:
+                return done, tried, waited, "", status
+            signal = self._stop_signal()
+            if signal:
+                return done, tried, waited, signal, status
+            time.sleep(self._poll_wait)
+
+    def _status_of(self, mid: str) -> Optional[tuple[str, list]]:
+        """store.status_of, or None when the row cannot be read just now or is malformed (the mailbox
+        is shared with other versions and sessions)."""
+        try:
+            return self.store.status_of(mid)
+        except (sqlite3.Error, ValueError, TypeError):
+            return None
 
     def flush(self, session_id: str) -> None:
         """Inject held messages for an idle session hosted here (called after its turn ended)."""
@@ -1442,12 +1584,12 @@ class Hub:
         text, note = self._body(caller_id, "send", body)
         with self._keeping(caller_id, "send", text, note):
             target = self.resolve(to, caller_id=caller_id) if caller_id not in SYSTEM_SENDERS else self.peer(to)
-        return _noted(self._post(caller_id, target.session_id, text, kind=kind), note)
+        return _noted(self._post(caller_id, target.session_id, text, kind=kind)[0], note)
 
     def _post(self, sender_id: str, target_id: str, text: str, *, kind: str = "message",
-              request_id: str = "") -> dict:
-        """Deliver already-validated *text* to an already-resolved target."""
-        return self.deliver(Message(mid=_mid(), sender_id=sender_id, sender_label=self.label(sender_id),
+              request_id: str = "", until: Optional[float] = None) -> tuple[dict, str, str]:
+        """Deliver already-validated *text* to an already-resolved target (returns as _deliver)."""
+        return self._deliver(until=until, m=Message(mid=_mid(), sender_id=sender_id, sender_label=self.label(sender_id),
                                     target_id=target_id, body=text, kind=kind, request_id=request_id,
                                     created=self._clock()))
 
@@ -1469,8 +1611,40 @@ class Hub:
                 f"request_id {safe_id(w['request_id'])} ({self.quoted(w['question'], 200)}). Reply to it first "
                 "with action=reply, or use action=send instead of ask.")
         rid = "req_" + uuid.uuid4().hex[:10]
+        # The whole call, a relay wait included, stays within timeout_s (and so within Hermes's deadline).
+        deadline = time.monotonic() + max(5.0, min(float(timeout_s), 360.0))
         self.store.add_waiter(rid, caller, target.session_id, text, self._clock(), self.token)
-        info = self._post(caller, target.session_id, text, kind="question", request_id=rid)
+        try:
+            return self._await_answer(caller, target, text, note, rid, deadline)
+        except BaseException:
+            self._abandon_question(rid, caller)
+            raise
+
+    def _abandon_question(self, rid: str, asker: str) -> None:
+        """`ask` failed after storing the waiter of question *rid*; nobody will read it. A question
+        that never went out is closed (no reply may be routed to it). Otherwise the waiter is
+        released, so a later answer comes as a message, and one that already landed in it is stored
+        as that message, for the asker under its current id."""
+        try:
+            if not self.store.question_sent(rid) and self.store.take_question(rid):
+                return
+            raced = self.store.release(rid)
+            if raced:
+                m = Message(mid=_mid(), sender_id=raced["target_id"] or "", sender_label=raced["replier_label"] or "",
+                            target_id=self.canonical(raced["asker_id"] or asker), body=raced["reply"], kind="reply",
+                            request_id=rid, created=self._clock())
+                self.store.add(m)
+                self.store.delete_waiter(rid)
+                self._bump()
+                self._log("held", m)
+        except sqlite3.Error:
+            logger.warning("intercom: could not release question %s", rid, exc_info=True)
+
+    def _await_answer(self, caller: str, target: Peer, text: str, note: str, rid: str, deadline: float) -> dict:
+        """The rest of `ask`, once the question is stored: post it, then wait for the answer until
+        *deadline* (time.monotonic())."""
+        info, outcome, signal = self._post(caller, target.session_id, text, kind="question", request_id=rid,
+                                           until=deadline)
         info["request_id"] = rid
 
         def answered(row: dict) -> dict:
@@ -1478,17 +1652,23 @@ class Hub:
             return _noted({"status": "answered", "request_id": rid, "from": self.line(row["replier_label"], 160),
                            "answer": self.safe(row["reply"])}, note)
 
-        if target.state == "awaiting_input" or info.get("delivery", "").startswith("target session is not loaded"):
-            self.store.release(rid)
+        def pending() -> dict:
+            raced = self.store.release(rid)  # an answer may have landed while the relay was watched
+            if raced:
+                return answered(raced)
             info["status"] = "pending"
             info["note"] = (info.get("note", "") + " The answer will reach you later as an intercom message.").strip()
             return _noted(info, note)
-        deadline = time.monotonic() + max(5.0, min(float(timeout_s), 360.0))
-        signal = ""
+
+        if (target.state == "awaiting_input" or outcome == "held") and not signal:
+            return pending()
         while time.monotonic() < deadline and not signal:
             w = self.store.waiter(rid)
             if w and w.get("reply") is not None:
                 return answered(w)
+            if outcome == "relaying" and self._fell_back(info["message_id"]):
+                info["delivery"] = self._held_text()  # the process that was starting it gave up
+                return pending()
             signal = self._stop_signal()
             if not signal:
                 time.sleep(self._poll_wait)
@@ -1507,6 +1687,12 @@ class Hub:
         if now.state == "awaiting_input":
             info["note"] += f" Target is now blocked on a {now.input_kind} prompt for {self.user}."
         return _noted(info, note)
+
+    def _fell_back(self, mid: str) -> bool:
+        """Is *mid*, which another process was starting a turn with, held again (that process's host
+        refused it)? A status that cannot be read says no."""
+        row = self._status_of(mid)
+        return row is not None and row[0] == "held"
 
     def reply(self, caller_id: str, request_id: str, body: str) -> dict:
         if not caller_id:

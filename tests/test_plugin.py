@@ -358,6 +358,11 @@ class SeamTests(Base):
     def test_doctor_reports_a_transcript_it_can_no_longer_read(self):
         self.sql("ALTER TABLE messages RENAME COLUMN content TO body")
         self.assertIn("final message", self.problems())
+        self.assertNotIn("are listed", self.problems())  # the listing filter does not read `content`
+
+    def test_doctor_reports_a_transcript_the_listing_filter_can_no_longer_read(self):
+        self.sql("ALTER TABLE messages RENAME COLUMN role TO kind")
+        self.assertIn("never replied in", self.problems())
 
     def test_doctor_reports_background_work_it_can_no_longer_see(self):
         self.sql("DROP TABLE async_delegations")

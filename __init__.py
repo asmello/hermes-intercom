@@ -399,8 +399,10 @@ def check_seams(ctx=None) -> list[str]:
             problems.append(f"state.db sessions table lacks {sorted(need - cols['sessions'])} (listing degrades)")
         lacks = set(TRANSCRIPT_COLUMNS) - cols["messages"]
         if lacks:
+            listing = (", and chat sessions the agent never replied in (e.g. cron delivery threads) are listed"
+                       if lacks & {"session_id", "role"} else "")
             problems.append(f"state.db messages table lacks {sorted(lacks)} (wait cannot show a session's "
-                            "final message)")
+                            f"final message{listing})")
         if "state" not in cols["async_delegations"] or not set(DELEGATION_SESSION_COLUMNS) & cols["async_delegations"]:
             problems.append("state.db async_delegations table is not as expected (wait cannot see background "
                             "work: a session that will be resumed by its subagents looks yielded)")
