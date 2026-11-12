@@ -101,9 +101,14 @@ question. Of two sessions that register on each other at the same moment, one is
 - target blocked on clarify/approval/sudo → held, lands in that prompt's tool result when it resolves
   or times out (`agent.clarify_timeout`, default 1h); the sender is told it's blocked and on what
 - target not hosted by any process that has seen it run → every live process tries to inject it once (covers
-  a window that's open but hasn't run a turn since its process started); otherwise held until the session's
-  next turn, in whichever process runs it. Held messages survive restarts and reboots (7-day retention).
-- target unloaded by Hermes (its window was closed) → held until its next turn; the sender is told
+  a window that's open but hasn't run a turn since its process started, and a chat session, which only the
+  messaging gateway can start); otherwise held until the session's next turn, in whichever process runs it.
+  The sender's call waits up to `relay_wait_seconds` for another process to take it and says which
+  happened: an `ask` whose question another process delivered keeps waiting for the answer. A stop or a
+  mid-turn message from the user ends that wait early. Held messages survive restarts and reboots (7-day
+  retention).
+- target unloaded by Hermes (its window was closed) → held until its next turn, without waiting for a relay
+  (no process starts a session its host unloaded); the sender is told
 - `ask` works across processes: the asker polls the mailbox for the reply; a reply to an asker whose process
   has died is delivered as a normal message instead.
 - `ask` and `wait` stop blocking when the user stops the session or sends it a message mid-turn.
@@ -131,9 +136,16 @@ without spawning the kanban CLI; create it with `hermes kanban boards create ses
 - `settings.user_name` — how messages refer to the human (default `the user`)
 - `settings.sources` — `state.db` session sources that can be listed/targeted
   (default `[gui, local, tui, cli, desktop, acp]`; add e.g. `matrix` to reach messaging chats, whose replies
-  are then posted in that chat)
+  are then posted in that chat). A session from a source outside the defaults is listed only once the agent
+  has replied in it (or it continues a compacted session that it replaced): Hermes creates one for every
+  thread a cron delivery opens, holding only the brief, and nobody's conversation is in it until the user
+  answers there and the agent replies. A session hosted by a running process is always listed. Mail for a
+  messaging session is only ever started with its route key, never its bare id (which the gateway accepts
+  and then drops).
 - `settings.poll_seconds` (3) — how often each process checks for mail left by other processes (a token-file
   read; the mailbox is only queried when it changed)
+- `settings.relay_wait_seconds` (`poll_seconds` + 2, at most 30) — how long a call whose target this process
+  cannot start waits for another process to start it before reporting the message as held
 - `settings.run_dir` — override the presence directory (all processes of one Hermes home must agree)
 - `settings.watchdog.enabled` (default true), `.board` (`sessions`), `.stale_minutes` (60),
   `.renudge_minutes` (60), `.interval_seconds` (300)
@@ -146,12 +158,14 @@ Only documented surfaces: `register_tool/hook/command/cli_command`, `inject_mess
 payloads in the hooks catalog, `gateway.session_context.get_session_env` / `bound_session_key`. `state.db`
 (session titles; for `wait`, the transcript, the turn leases and the background-delegation table), the
 kanban CLI and board reader, `tools.interrupt` (user stop / mid-turn message during a blocking call) and
-Hermes's list of control-frame openers are read defensively: listing degrades, a wait reports less or runs to its timeout,
+Hermes's list of control-frame openers are read defensively: listing degrades (without the transcript table,
+chat sessions the agent never replied in are listed too), a wait reports less or runs to its timeout,
 the plugin's own copy of the list is used, nothing crashes. The seam check runs at every load, logs a
 warning and pops a desktop notification (macOS, or `notify-send` on a Linux desktop) once per new problem
 set; run `hermes intercom doctor` after an update to check by hand.
 
-`ask` and `wait` block for at most 360 s, inside Hermes's default tool deadline (420 s). With a lower
+`ask` and `wait` block for at most 360 s (an `ask`'s relay wait counts towards its `timeout_s`), inside
+Hermes's default tool deadline (420 s). A `send` or `reply` blocks for at most `relay_wait_seconds`. With a lower
 deadline configured (`timeouts.tools.sequential_call`), Hermes abandons the call first: the caller gets a
 tool timeout instead of the outcome, and a `wait` is then dropped rather than left registered. Keep
 `timeout_s` below the configured deadline.
@@ -159,8 +173,29 @@ tool timeout instead of the outcome, and a `wait` is then dropped rather than le
 Tests: `cd ~/.hermes/plugins && python3 -m unittest discover -s intercom/tests -t .` (`test_core`: the logic
 with a fake clock; `test_plugin`: the tool handler and hook adapters; `test_processes`: `wait` across real
 OS processes sharing one mailbox)
-Reload after editing, without restarting anything: `hermes plugins update intercom` on a tracking branch, or
-`hermes_cli.plugins_activation.activate_plugin_now("intercom", in_process=False)` under the interpreter Hermes
-runs. Either one unloads and reloads every plugin of the Desktop backend and the gateway: the handler, hooks
-and commands are live at once, the tool's description waits for the next session, and the new hub takes over
-the running one's state. Drop the `__pycache__` directories first.
+### Updating and reloading
+`hermes plugins update intercom` (on a tracking branch) pulls the new revision, drops the `__pycache__`
+directories and records the revision. It does **not** reload the plugin: running processes keep the old code
+until they reload it or restart. (The Update button on the Desktop/dashboard plugin page reloads when it
+pulls something new; after a CLI `update` it finds nothing to pull and reloads nothing.) A caution verdict from Hermes's plugin scanner needs consent, which is only
+asked on a terminal: from a session without one, read the findings and pass `--force`.
+
+To load a new revision into the running Desktop backend and gateway without restarting anything, run under
+the interpreter Hermes runs, with Hermes's checkout on `sys.path`:
+
+```python
+from hermes_cli.plugins_activation import activate_plugin_now
+activate_plugin_now("intercom", in_process=False)
+```
+
+It unloads and reloads every plugin of the gateway and of one Desktop/dashboard backend (the host owner's,
+else the Desktop's; reload or restart any other one separately): the handler, hooks and commands are live at
+once, the tool's description waits for the next session, and the new hub takes over the running one's state. When the
+files were changed without `update` (e.g. a checkout of another commit), drop the `__pycache__` directories
+first. Avoid `hermes plugins disable intercom && hermes plugins enable intercom` as a reload: disabling
+unloads the plugin in the gateway only (the Desktop backend keeps it until it next re-discovers plugins) and
+leaves the gateway without the tool and hooks until `enable` runs; meanwhile the poller started by the first
+load keeps delivering there. Disabling also
+removes the `intercom` toolset from every saved `platform_toolsets` list, and enabling adds it to every saved
+list, including those it was left out of. `hermes plugins enable` on its own does nothing while the plugin is
+enabled.

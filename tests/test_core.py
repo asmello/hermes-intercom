@@ -75,6 +75,8 @@ class Base(unittest.TestCase):
 
     def make_hub(self, inject, token, **kw):
         kw.setdefault("schedule", lambda d, fn: None)
+        # No other process runs a poller in these tests unless one says so: don't wait for one.
+        kw.setdefault("settings", lambda key, default: {"relay_wait_seconds": 0}.get(key, default))
         return Hub(inject=inject, db_path=self.db, log_path=Path(self.tmp.name) / "log.jsonl",
                    clock=lambda: self.now, store_path=Path(self.tmp.name) / "intercom.db",
                    run_dir=Path(self.tmp.name) / "run", token=token, alive=lambda t: t in self.alive,
@@ -146,6 +148,151 @@ class DirectoryTests(Base):
             self.hub.resolve("alpha", caller_id=A)  # self excluded
         with self.assertRaises(IntercomError):
             self.hub.resolve("nothing-like-this", caller_id=A)
+
+
+M_STUB = "20260314_111111_5e5ed17a"  # a thread a cron job opened in a chat room; nobody answered in it
+M_CHAT = "20260314_121212_c4a7f00d"  # a chat thread with a conversation in it
+
+
+class ChatSessionTests(Base):
+    """Messaging-platform sessions (targetable once their source is in `sources`). Hermes seeds a
+    session row for every thread a cron delivery opens, with the brief as its only message: those
+    are nobody's conversation and must not be listed or woken."""
+
+    def setUp(self):
+        super().setUp()
+        for sid, ago in ((M_STUB, 40), (M_CHAT, 90)):
+            self.sql("INSERT INTO sessions (id, source, session_key, title, last_activity_at, started_at) "
+                     "VALUES (?,?,?,?,?,?)", sid, "matrix", f"agent:main:matrix:dm:!room:$ev{sid[-4:]}", "",
+                     self.now - ago, self.now - ago)
+        self.says(M_STUB, "[Cron delivery: example digest] three new items", role="user")
+        self.says(M_CHAT, "[Replying to: the digest] which one is free?", role="user")
+        self.says(M_CHAT, "The second one.")
+        self.settings = {"relay_wait_seconds": 0, "sources": ["gui", "local", "desktop", "matrix"]}
+
+        def inject(text, session_key):
+            self.injected.append((session_key, text))
+            return self.inject_ok
+
+        self.hub = self.make_hub(inject, token="100:x", settings=lambda k, d: self.settings.get(k, d))
+
+    def listed(self):
+        return {p.session_id for p in self.hub.peers()}
+
+    def test_a_delivery_thread_nobody_answered_in_is_not_listed(self):
+        self.assertEqual(self.listed(), {A, B, C4, M_CHAT})  # desktop sessions with no turn yet stay listed
+
+    def test_a_delivery_thread_nobody_answered_in_cannot_be_addressed(self):
+        with self.assertRaises(IntercomError) as cm:
+            self.hub.send(A, "5e5ed17a", "hello")
+        self.assertIn("no session matches", str(cm.exception))
+        self.assertEqual(self.injected, [])
+
+    def test_a_delivery_thread_the_user_answered_in_is_listed(self):
+        self.says(M_STUB, "Noted.")
+        self.assertIn(M_STUB, self.listed())
+
+    def test_a_chat_session_running_its_first_turn_is_listed(self):
+        self.hub.on_turn_start(M_STUB, "which one?", f"agent:main:matrix:dm:!room:$ev{M_STUB[-4:]}", "matrix")
+        self.assertIn(M_STUB, self.listed())
+
+    def test_without_a_readable_transcript_every_chat_session_is_listed(self):
+        self.sql("ALTER TABLE messages RENAME TO messages_moved")  # e.g. a Hermes update renamed it
+        self.assertEqual(self.listed(), {A, B, C4, M_CHAT, M_STUB})
+
+    def test_a_delivery_thread_whose_parent_ended_for_another_reason_stays_hidden(self):
+        child = "20260314_141414_0ddba11a"
+        self.sql("UPDATE sessions SET end_reason='idle', ended_at=? WHERE id=?", self.now - 30, M_CHAT)
+        self.sql("INSERT INTO sessions (id, source, session_key, title, last_activity_at, started_at, "
+                 "parent_session_id) VALUES (?,?,?,?,?,?,?)", child, "matrix", "agent:main:matrix:dm:!room",
+                 "", self.now - 20, self.now - 20, M_CHAT)
+        self.says(child, "[Cron delivery: example digest] two new items", role="user")
+        self.assertNotIn(child, self.listed())
+
+    def held_for(self, target):
+        """Mail left in the mailbox for *target* (e.g. by an older version, before it was hidden)."""
+        self.hub.store.add(Message(mid="m_" + target[-6:], sender_id=A, sender_label="Alpha work", target_id=target,
+                                   body="are you there?", created=self.now))
+        self.hub._bump()  # as every writer does: pollers re-read the mailbox only when the token changes
+
+    def test_mail_held_for_a_hidden_delivery_thread_is_never_sent_under_its_bare_id(self):
+        # The gateway accepts any key it does not know and drops the turn later: the plugin would
+        # record mail it never delivered as injected.
+        self.held_for(M_STUB)
+        self.hub.poll_once()
+        self.assertEqual(self.injected, [])
+
+    def test_a_closed_delivery_thread_is_not_woken_through_its_old_route_key(self):
+        key = f"agent:main:matrix:dm:!room:$ev{M_STUB[-4:]}"
+        self.hub.on_turn_start(M_STUB, "which one?", key, "matrix")  # the user answered; the turn failed
+        self.hub.on_turn_end(M_STUB, "failed")
+        self.hub.on_closed(M_STUB, "matrix")
+        self.hub.send(core.WATCHDOG_SENDER, M_STUB, "your card is stale", kind="nudge")
+        self.assertEqual(self.injected, [])
+
+    def test_mail_for_a_chat_another_process_runs_is_relayed_even_when_its_source_is_not_listed(self):
+        self.settings["sources"] = ["gui", "local", "desktop"]
+        key = f"agent:main:matrix:dm:!room:$ev{M_CHAT[-4:]}"
+        self.hub.on_turn_start(M_CHAT, "which one?", key, "matrix")  # X: the gateway runs it
+        self.hub.on_turn_end(M_CHAT, "completed")
+        self.alive.add("300:y")
+        y = self.make_hub(lambda *a, **k: False, token="300:y",
+                          settings=lambda k, d: {"relay_wait_seconds": 5, "sources": ["gui", "local", "desktop"]}.get(k, d))
+        msg = Message(mid="m_answer", sender_id=A, sender_label="Alpha work", target_id=M_CHAT, body="slot 2",
+                      kind="reply", created=self.now)
+        t, result = self.in_thread(y.deliver, msg)  # e.g. a Desktop session answering the chat's question
+        deadline = time.monotonic() + 5
+        while not self.injected and time.monotonic() < deadline:
+            self.hub.poll_once()
+            time.sleep(0.02)
+        t.join(5)
+        self.assertEqual([k for k, _ in self.injected], [key])
+        self.assertIn("another Hermes process started a turn", result["delivery"])
+
+    def test_a_nudge_for_a_hidden_delivery_thread_does_not_wait_for_a_relay(self):
+        self.settings["relay_wait_seconds"] = 5
+        started = time.monotonic()
+        info = self.hub.send(core.WATCHDOG_SENDER, M_STUB, "your card is stale", kind="nudge")
+        self.assertLess(time.monotonic() - started, 2)  # no process will start it: the watchdog moves on
+        self.assertIn("held until its next turn", info["delivery"])
+
+    def test_a_chat_session_older_than_the_list_window_is_reached_by_its_route_key(self):
+        self.sql("UPDATE sessions SET last_activity_at=?, started_at=? WHERE id=?", self.now - 3 * 86400,
+                 self.now - 3 * 86400, M_CHAT)
+        self.hub.send(A, "c4a7f00d", "still free?")
+        self.assertEqual([k for k, _ in self.injected], [f"agent:main:matrix:dm:!room:$ev{M_CHAT[-4:]}"])
+
+    def test_a_chat_session_this_process_runs_gets_its_mail_even_when_its_source_is_not_listed(self):
+        self.settings["sources"] = ["gui", "local", "desktop"]  # e.g. the default: chats not targetable
+        key = f"agent:main:matrix:dm:!room:$ev{M_CHAT[-4:]}"
+        self.hub.on_turn_start(M_CHAT, "which one?", key, "matrix")  # the gateway runs it
+        self.hub.on_turn_end(M_CHAT, "completed")
+        self.held_for(M_CHAT)  # e.g. a late answer to a question it asked
+        self.hub.poll_once()
+        self.assertEqual([k for k, _ in self.injected], [key])
+
+    def test_a_chat_session_of_unknown_source_is_never_tried_under_its_bare_id(self):
+        # e.g. state.db unreadable: the hooks still said which platform it is on
+        self.assertIsNone(self.hub._try_inject(core.Peer(session_id=M_CHAT, platform="matrix"), "hello"))
+        self.assertEqual(self.injected, [])
+
+    def test_held_mail_for_an_old_desktop_session_is_still_tried_by_its_id(self):
+        old = "20260201_090000_01d5e551"
+        self.sql("INSERT INTO sessions (id, source, session_key, title, last_activity_at, started_at) "
+                 "VALUES (?,?,?,?,?,?)", old, "desktop", None, "Old work", self.now - 30 * 86400, self.now - 30 * 86400)
+        self.held_for(old)
+        self.hub.poll_once()
+        self.assertEqual([k for k, _ in self.injected], [old])
+
+    def test_a_chat_compacted_into_a_new_session_stays_reachable_before_its_next_reply(self):
+        child = "20260314_131313_d00dfeed"
+        self.sql("UPDATE sessions SET end_reason='compression', ended_at=? WHERE id=?", self.now - 30, M_CHAT)
+        self.sql("INSERT INTO sessions (id, source, session_key, title, last_activity_at, started_at, "
+                 "parent_session_id) VALUES (?,?,?,?,?,?,?)", child, "matrix", "agent:main:matrix:dm:!room:$evc",
+                 "Free slots", self.now - 30, self.now - 30, M_CHAT)
+        self.says(child, "[CONTEXT SUMMARY] the user asked which slot is free", role="user")
+        self.assertIn(child, self.listed())
+        self.assertEqual(self.hub.resolve(M_CHAT, caller_id=A).session_id, child)
 
 
 class DatedBase(Base):
@@ -1758,6 +1905,257 @@ class CrossProcessTests(Base):
         self.hub.poll_once()  # X hosts it after all (window open, no turn yet)
         self.assertEqual(len(self.injected), 1)
         self.assertIn("anyone?", self.injected[0][1])
+
+    def relaying_hub(self, wait_s, **kw):
+        """Process Y, which hosts nothing, now giving the other processes' pollers *wait_s* seconds."""
+        return self.make_hub(lambda text, session_key: self.y_injected.append((session_key, text)) and False,
+                             token="300:y", settings=lambda k, d: {"relay_wait_seconds": wait_s}.get(k, d), **kw)
+
+    def poll_until_injected(self, hub, timeout=5.0):
+        """Another process's poller ticking until it has started a turn with the held mail."""
+        deadline = time.monotonic() + timeout
+        while not self.injected and time.monotonic() < deadline:
+            hub.poll_once()
+            time.sleep(0.02)
+
+    def test_mail_for_a_session_hosted_by_the_sender_is_held_without_waiting_for_a_relay(self):
+        x = self.make_hub(lambda *a, **k: False, token="100:x",
+                          settings=lambda k, d: {"relay_wait_seconds": 5}.get(k, d))
+        x.on_turn_start(B, "w")
+        x.on_turn_end(B)  # idle here, but its host refuses the turn (e.g. a transient failure)
+        started = time.monotonic()
+        info = x.send(A, B, "anyone?")
+        self.assertLess(time.monotonic() - started, 2)  # only this process's own poller could deliver it
+        self.assertIn("held until its next turn", info["delivery"])
+        self.assertNotIn("tried", info["delivery"])
+
+    def test_mail_another_process_starts_a_turn_with_is_reported_as_relayed(self):
+        y = self.relaying_hub(5)
+        started = time.monotonic()
+        t, result = self.in_thread(y.send, A, B, "anyone?")
+        self.poll_until_injected(self.hub)  # X: e.g. the messaging gateway, for a chat session
+        t.join(5)
+        self.assertIn("another Hermes process started a turn", result["delivery"])
+        self.assertNotIn("not loaded", result["delivery"])
+        self.assertLess(time.monotonic() - started, 4)  # did not sit out the window
+        self.assertIn("anyone?", self.injected[0][1])
+
+    def test_an_ask_another_process_delivers_keeps_waiting_for_the_answer(self):
+        y = self.relaying_hub(5)
+        t, result = self.in_thread(y.ask, A, B, "done yet?", timeout_s=10)
+        self.poll_until_injected(self.hub)
+        rid = self.injected[0][1].split("request_id: ")[1].split()[0]
+        self.assertEqual(self.hub.reply(B, rid, "yes")["status"], "delivered")
+        t.join(5)
+        self.assertEqual((result.get("status"), result.get("answer")), ("answered", "yes"))
+
+    def test_mail_no_process_takes_is_held_once_the_relay_window_is_over(self):
+        y = self.relaying_hub(0.3)
+        started = time.monotonic()
+        info = y.send(A, B, "anyone?")
+        self.assertGreaterEqual(time.monotonic() - started, 0.3)
+        self.assertIn("not loaded", info["delivery"])
+        self.assertIn("held until its next turn", info["delivery"])
+        self.assertRegex(info["delivery"], r"within 0\.[3-9] s; 0 other process\(es\) tried")
+        self.assertEqual(y.ask(A, B, "still nobody?", timeout_s=60)["status"], "pending")
+
+    def test_the_held_note_counts_the_other_processes_that_tried(self):
+        self.inject_ok = False  # X cannot start it either
+        y = self.relaying_hub(1.0)
+        t, result = self.in_thread(y.send, A, B, "anyone?")
+        time.sleep(0.2)
+        self.hub.poll_once()
+        t.join(5)
+        self.assertIn("1 other process(es) tried", result["delivery"])
+
+    def starting(self, until):
+        """Mailbox.status_of as seen while another process is starting a turn with the message (status
+        'injecting') until *until* is set, then as it really is."""
+        real = core.Mailbox.status_of
+
+        def status_of(store, mid):
+            row = real(store, mid)
+            return ("injecting", row[1]) if row and not until.is_set() else row
+
+        return mock.patch.object(core.Mailbox, "status_of", status_of)
+
+    def test_mail_still_being_started_elsewhere_when_the_window_closes_is_reported_as_relaying(self):
+        with self.starting(threading.Event()):
+            info = self.relaying_hub(0.3).send(A, B, "anyone?")
+        self.assertIn("is starting a turn with it", info["delivery"])
+
+    def test_a_stop_while_another_process_is_starting_the_turn_is_reported(self):
+        with self.starting(threading.Event()):
+            info = self.relaying_hub(30, interrupted=lambda: "stop").send(A, B, "anyone?")
+        self.assertIn("is starting a turn with it", info["delivery"])
+        self.assertIn("stopped waiting", info["delivery"])
+
+    def test_an_ask_keeps_waiting_while_another_process_is_still_starting_the_turn(self):
+        y = self.relaying_hub(0.3)
+
+        def answer_later():
+            for _ in range(250):
+                waiting = y.store.waiters(asker_id=A)
+                if waiting:
+                    time.sleep(0.6)  # well after the relay window closed on "relaying"
+                    y.store.answer_blocking(waiting[0]["request_id"], "yes", "Beta rebase (bbbb2222)")
+                    return
+                time.sleep(0.02)
+
+        t = threading.Thread(target=answer_later)
+        with self.starting(threading.Event()):
+            t.start()
+            info = y.ask(A, B, "anyone?", timeout_s=10)
+        t.join(5)
+        self.assertEqual((info["status"], info.get("answer")), ("answered", "yes"))
+
+    def test_mail_that_reached_a_turn_started_meanwhile_is_not_credited_to_a_relay(self):
+        with mock.patch.object(core.Mailbox, "status_of", lambda store, mid: ("delivered_turn_start", [])):
+            info = self.relaying_hub(1.0).send(A, B, "anyone?")
+        self.assertIn("in a turn that started meanwhile", info["delivery"])
+        self.assertNotIn("started a turn with it", info["delivery"])
+
+    def test_an_ask_spends_its_timeout_on_the_relay_too(self):
+        with self.starting(threading.Event()):
+            started = time.monotonic()
+            info = self.relaying_hub(10).ask(A, B, "anyone?", timeout_s=5)
+        self.assertEqual(info["status"], "no_reply_yet")
+        self.assertLess(time.monotonic() - started, 7)  # neither the 10 s relay window nor 5 s on top of it
+
+    def test_an_ask_that_fails_before_its_question_goes_out_leaves_nothing_behind(self):
+        y = self.relaying_hub(0)
+        with mock.patch.object(core.Hub, "_deliver", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                y.ask(A, B, "anyone?", timeout_s=10)
+        # The question never went out: nothing must be left for the target's reply to be routed to.
+        self.assertEqual(y.store.waiters(asker_id=A), [])
+        self.assertEqual(y.store.waiters(target_id=B), [])
+
+    def test_an_ask_whose_mailbox_fails_while_it_waits_does_not_leave_it_blocking(self):
+        self.hub.on_turn_start(B, "w")  # running in X: the question is held for its next tool result
+        with mock.patch.object(core.Mailbox, "waiter", side_effect=sqlite3.OperationalError("locked")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.y.ask(A, B, "anyone?", timeout_s=10)
+        (w,) = self.y.store.waiters(asker_id=A)
+        self.assertFalse(w["blocking"])
+
+    def test_an_answer_that_raced_in_before_an_ask_failed_comes_as_a_message(self):
+        y = self.relaying_hub(0)
+
+        def answered_then_failed(m, until=None):
+            y.store.answer_blocking(m.request_id, "yes", "Beta rebase (bbbb2222)")
+            raise RuntimeError("boom")
+
+        with mock.patch.object(y, "_deliver", side_effect=answered_then_failed):
+            with self.assertRaises(RuntimeError):
+                y.ask(A, B, "anyone?", timeout_s=10)
+        self.assertEqual([(m.kind, m.body) for m in y.store.held_for(A)], [("reply", "yes")])
+        self.assertEqual(y.store.waiters(asker_id=A), [])
+        log = [json.loads(ln) for ln in (Path(self.tmp.name) / "log.jsonl").read_text().splitlines()]
+        self.assertIn(("held", "reply", A), [(e["event"], e["kind"], e["to"]) for e in log])
+
+    def test_an_answer_rescued_for_a_compacted_asker_goes_to_its_new_id(self):
+        y = self.relaying_hub(0)
+
+        def compacted_answered_then_failed(m, until=None):
+            y.store.retarget(A, C4)  # the asker was compacted meanwhile
+            y.store.answer_blocking(m.request_id, "yes", "Beta rebase (bbbb2222)")
+            raise RuntimeError("boom")
+
+        with mock.patch.object(y, "_deliver", side_effect=compacted_answered_then_failed):
+            with self.assertRaises(RuntimeError):
+                y.ask(A, B, "anyone?", timeout_s=10)
+        self.assertEqual([m.body for m in y.store.held_for(C4)], ["yes"])
+
+    def test_a_status_row_whose_tried_list_another_writer_mangled_is_read_as_empty(self):
+        y = self.relaying_hub(0.5)
+
+        def mangle():
+            time.sleep(0.1)
+            conn = sqlite3.connect(y.store.path)
+            conn.execute("UPDATE messages SET tried='5'")  # e.g. an older version's format
+            conn.commit()
+            conn.close()
+
+        t = threading.Thread(target=mangle)
+        t.start()
+        info = y.send(A, B, "anyone?")
+        t.join(5)
+        self.assertIn("0 other process(es) tried", info["delivery"])
+
+    def test_a_malformed_status_row_is_no_news(self):
+        y = self.relaying_hub(0.3)
+        with mock.patch.object(core.Mailbox, "status_of", side_effect=ValueError("bad tried")):
+            self.assertEqual(y.ask(A, B, "anyone?", timeout_s=10)["status"], "pending")
+
+    def test_a_stop_ends_the_relay_window(self):
+        y = self.relaying_hub(30, interrupted=lambda: "stop")
+        started = time.monotonic()
+        info = y.send(A, B, "anyone?")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("held until its next turn", info["delivery"])
+        self.assertRegex(info["delivery"], r"stopped waiting after 0\.\d s")  # not "nobody took it within 30 s"
+        self.assertNotIn("within 30", info["delivery"])
+
+    def test_a_steer_during_the_relay_window_interrupts_an_ask(self):
+        signals = iter(["", "steer"])
+        y = self.relaying_hub(30, interrupted=lambda: next(signals, ""))
+        info = y.ask(A, B, "anyone?", timeout_s=60)
+        self.assertEqual(info["status"], "interrupted")  # the consumed steer is not swallowed
+        self.assertFalse(y.store.waiter(info["request_id"])["blocking"])
+
+    def test_an_unreadable_status_is_no_news(self):
+        y = self.relaying_hub(0.3)
+        with mock.patch.object(core.Mailbox, "status_of", side_effect=sqlite3.OperationalError("locked")):
+            info = y.send(A, B, "anyone?")
+        self.assertIn("held until its next turn", info["delivery"])
+
+    def test_an_answer_that_lands_while_the_relay_status_cannot_be_read_is_returned(self):
+        y = self.relaying_hub(4)
+        with mock.patch.object(core.Mailbox, "status_of", side_effect=sqlite3.OperationalError("locked")):
+            t, result = self.in_thread(y.ask, A, B, "done yet?", timeout_s=10)
+            self.poll_until_injected(self.hub)  # X delivers it; Y cannot see that
+            rid = self.injected[0][1].split("request_id: ")[1].split()[0]
+            self.assertEqual(self.hub.reply(B, rid, "yes")["status"], "delivered")
+            t.join(5)
+        self.assertEqual((result.get("status"), result.get("answer")), ("answered", "yes"))
+
+    def test_a_relay_that_falls_back_to_held_releases_the_ask(self):
+        y = self.relaying_hub(0.3)
+        relay_over = threading.Event()  # another process was starting it; its host refuses once the window is over
+        real_wait = core.Hub._await_relay
+
+        def await_relay(hub, *a, **k):
+            try:
+                return real_wait(hub, *a, **k)
+            finally:
+                relay_over.set()
+
+        with self.starting(relay_over), mock.patch.object(core.Hub, "_await_relay", await_relay):
+            started = time.monotonic()
+            info = y.ask(A, B, "anyone?", timeout_s=60)
+        self.assertEqual(info["status"], "pending")
+        self.assertIn("held until its next turn", info["delivery"])
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_mail_for_a_closed_session_is_held_without_waiting_for_a_relay(self):
+        self.hub.on_turn_start(B, "w")
+        self.hub.on_turn_end(B)
+        self.hub.on_closed(B)  # no poller starts a session its host unloaded
+        y = self.relaying_hub(5)
+        started = time.monotonic()
+        info = y.send(A, B, "are you there?")
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertIn("held until its next turn", info["delivery"])
+
+    def test_the_relay_window_follows_poll_seconds_and_stays_bounded(self):
+        for settings, window in (({}, 5.0), ({"poll_seconds": 10}, 12.0), ({"relay_wait_seconds": 99}, 30.0),
+                                 ({"relay_wait_seconds": -1}, 0.0), ({"relay_wait_seconds": "nan"}, 5.0),
+                                 ({"poll_seconds": float("nan")}, 5.0), ({"relay_wait_seconds": "inf"}, 30.0),
+                                 ({"poll_seconds": 10, "relay_wait_seconds": "nan"}, 12.0),
+                                 ({"relay_wait_seconds": 10 ** 400}, 5.0)):
+            hub = self.make_hub(lambda *a, **k: False, token="300:y", settings=lambda k, d, s=settings: s.get(k, d))
+            self.assertEqual(hub._relay_window(), window, settings)
 
     def test_dead_owner_is_ignored(self):
         self.hub.on_turn_start(B, "w")
