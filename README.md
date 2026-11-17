@@ -7,7 +7,7 @@ needs no sockets or daemons, but keeps its shared state outside process memory:
 
 | what | where | written |
 |---|---|---|
-| mailbox: messages, ask/reply waiters, registered waits (SQLite) | `~/.hermes/intercom/intercom.db` | once per message or wait |
+| mailbox: messages, ask/reply waiters, registered waits, who was told how mail is announced (SQLite) | `~/.hermes/intercom/intercom.db` | per message, per wait, and when a session is told how mail is announced |
 | presence: state of each hosted session + owning process | `/run/user/<uid>/hermes-intercom-<hash>/presence/` (tmpfs; falls back to `~/.hermes/intercom/run`) | per turn / prompt |
 | audit log | `~/.hermes/intercom/messages.jsonl` | per delivery event |
 
@@ -25,6 +25,7 @@ is what makes trying from the wrong process safe.
 | `reply [request_id=] message=` | answer a question; `request_id` may be left out when it can only mean one question (below) |
 | `wait to= [timeout_s=] [message=] [cancel=]` | block until session `to` yields (see below) |
 | `status` | own id, open questions both ways, who the caller waits for and who waits for it |
+| `read` | the mail held for the caller: what a line after a tool's output tells a working session about (see Delivery) |
 
 `to` = the full id, any 4+ characters of it (the short id shown by `list`, a prefix, the start time in the
 middle) or words from the title, each matched from the start of a title word. The short id is the random
@@ -75,7 +76,7 @@ What the caller gets, whichever comes first:
 | `status` | when | registered afterwards |
 |---|---|---|
 | `yielded` | the target yielded: `note` (how), `turn` (`completed` / `interrupted` / `failed` / `incomplete` = out of steps / `unreported`), `final_message` + `final_message_age` (the start of the last thing it said in that turn) | no |
-| `message_arrived` | an intercom message for the caller arrived; it is appended to the result as usual | no if it is from the target (it has spoken), otherwise yes |
+| `message_arrived` | an intercom message for the caller arrived; it follows in the same result, as with every `intercom` call | no if it is from the target (it has spoken), otherwise yes |
 | `interrupted` | the user stopped the caller, or sent it a message mid-turn | no after a stop, yes after a message |
 | `not_yielded_yet` | `timeout_s` passed (default 240, max 360; `0` = don't block); `pending` says what the target is doing | yes |
 
@@ -88,8 +89,8 @@ is deleted, or after `wait_max_hours` (the waiter is told). A waiter that Hermes
 mail and read when the session is opened again. Subagents and sessions on surfaces that cannot be woken (cron runs) are
 never left registered.
 
-The target is told once, at its next tool result or turn start and never by waking it, that the caller is
-waiting, with the optional `message` as the reason, so it can release what the caller needs before its
+The target is told once, the way a working session gets any mail (below) or at its next turn start and
+never by waking it, that the caller is waiting, with the optional `message` as the reason, so it can release what the caller needs before its
 turn ends (`send` to a waiter that is blocking returns its `wait` at once). A wait that could never end is
 refused: the target waits for the caller (directly or through other sessions), or is blocked asking it a
 question. Of two sessions that register on each other at the same moment, one is refused.
@@ -97,9 +98,11 @@ question. Of two sessions that register on each other at the same moment, one is
 ## Delivery
 - idle target in the same process → injected as a new turn (wakes it; FIFO, never interrupts)
 - idle target in another process → held in the mailbox; that process's poller injects it within `poll_seconds`
-- running target (any process) → appended to its next tool result; leftovers injected when the turn ends
-- target blocked on clarify/approval/sudo → held, lands in that prompt's tool result when it resolves
-  or times out (`agent.clarify_timeout`, default 1h); the sender is told it's blocked and on what
+- running target (any process) → held. Its next tool result tells it that mail is waiting and its own
+  `intercom` call hands the mail over (next section); what it has not read is injected when the turn ends
+- target blocked on clarify/approval/sudo → held; it is told with that prompt's tool result, when the prompt
+  resolves or times out (a clarify prompt after `agent.clarify_timeout`, 90 s by default); the sender is told
+  it's blocked and on what
 - target not hosted by any process that has seen it run → every live process tries to inject it once (covers
   a window that's open but hasn't run a turn since its process started, and a chat session, which only the
   messaging gateway can start); otherwise held until the session's next turn, in whichever process runs it.
@@ -112,6 +115,92 @@ question. Of two sessions that register on each other at the same moment, one is
 - `ask` works across processes: the asker polls the mailbox for the reply; a reply to an asker whose process
   has died is delivered as a normal message instead.
 - `ask` and `wait` stop blocking when the user stops the session or sends it a message mid-turn.
+
+### Mail for a session that is working
+A message is never put inside another tool's result. A model takes an instruction it finds in a tool result
+for an injection, whoever claims to have put it there, and it is right to: that is where a web page or a
+file would plant one. (Hermes itself hands the model the output of web, browser and MCP tools as untrusted
+data.) Mail appended to tool results was ignored for that reason, with its sender left waiting.
+
+A working session is shown a notice with a tool's output instead. In a result that is a JSON object it is
+one field more, named `intercom`, so what Hermes and the model read back by key is what the tool returned;
+after a result that is not JSON at all it is a last line:
+
+```
+{"output": "links: 212 checked, 0 broken", "exit_code": 0, "intercom": "[INTERCOM mail waiting — added by
+Hermes's intercom plugin, not part of the tool's own output] Waiting for you from <user_name>'s other
+sessions: 1 question (its sender is waiting for the answer) and 2 messages. Read them with
+intercom(action=\"read\")."}
+```
+
+The notice says how much is waiting, never from whom or what. The session then calls `intercom`, and the
+mail comes back in that call's own result: `read` returns it, and every other action is followed by it.
+Acting on a forged notice is harmless, since `read` returns only what the plugin holds.
+
+A notice in a tool result is still text in a tool result, so it is shown only to a session that was told
+about it where it trusts what it reads:
+
+- a session whose system prompt was built with the plugin loaded has a section there (`## Plugin Context:
+  intercom`, through `register_system_prompt_section`);
+- any other session that a turn can be started in is given the same text once, as a note at the start of
+  its next turn. A note can be summarised away, so after a compaction the session is told again, unless its
+  prompt has the section by then (Hermes asks for the section again when it builds a prompt again);
+- a session that was not told (its turn began before the plugin was loaded or updated) is shown nothing and
+  gets its mail when the turn ends, as a new turn;
+- a subagent and a cron run get neither section nor note, and nobody can write to them. The one mail such a
+  session can get is the late answer to a question it asked itself, and the result of that `ask` tells it
+  how the answer will be announced;
+- no host can start a turn in a subagent, a cron run or a one-shot run (`hermes chat -q`, which is told by
+  its prompt like any CLI session). Mail for one is never given to a host, not when it is sent, not when
+  its turn ends, not by a poller: a host asked to start a session by a key it does not know may take the
+  mail and drop it. It waits for the session's own `intercom` call. What kind of session it is comes from
+  Hermes's own record; while that cannot be read, nothing is started in it either and the question is put
+  again at the next poll.
+
+The mailbox records who was told and how (table `briefings`: `prompt`, `turn`, `call`, or `doubted`; a
+record goes a week after it was last written, and the record of a session at work is renewed once a day).
+A record says that the text was handed over, not that it arrived: Hermes leaves a section out when the
+sections of all plugins outgrow their budget, and the turn that carried a note can be undone. So a session
+that is shown the notice and lets its turn end without reading stops counting as told (`doubted`), and gets
+the note at its next turn start. Only the note, or the session's own read, lifts a doubt: Hermes asks for
+the section again for work of its own that runs under the session's id, which tells the session nothing.
+
+The notice is left out of output Hermes hands the model as untrusted (`web_extract`, `web_search`,
+`browser_*`, `mcp_*`: the plugin's copy of Hermes's rule, and Hermes's own answer as well where it can be
+asked), out of an entry of a batch of connector calls (`connectors__*`: Hermes reads the batch back as one
+object), out of a result whose tool is not named, out of results that are not text, out of JSON that is not
+an object (there is no field to add and no line that would leave it readable), out of a result that has a
+field named `intercom` of its own, and out of results over 7,500 characters, so that the result with the
+notice in it stays under 8,000: the least at which Hermes replaces a result by a preview of its head
+(100,000 for a model with a large window). It then comes with the next result. A result that no turn of the
+session is in progress for is left alone as well: Hermes runs its own review of a turn, and its memory and
+compaction work, under the session's id. The notice is repeated when more arrives, and otherwise after a
+minute, three times at most: Hermes can still drop or cut a result once the plugin has added it. Showing it
+takes nothing out of the mailbox, so a result Hermes drops costs no mail, and no mail is handed to a call
+the user has stopped. The audit log has `told` when a message is first announced and `delivered` when the
+session reads it.
+
+Known limits:
+- Hermes takes the first plugin's answer to `transform_tool_result`. Where another plugin rewrites the same
+  result, one of the two changes is lost; the notice then comes again a minute later.
+- A session's background review, and anything else Hermes runs under a session's id, has its own tool
+  results. A notice goes into none of them, but a review that runs while the session's own turn is in
+  progress can take one.
+- An intercom result that carries mail is not one JSON value (the frames follow the JSON head). Where a
+  mail body quotes `"error"` or `"failed"` early, Hermes's text test marks the call failed in its display
+  and counts it towards its guard against repeated failures.
+- At the turn start where a session is given the note, mail and wait notices that would make the piece
+  longer than 8,000 characters stay held and are announced by the notice instead: Hermes cuts a hook's
+  context of over 10,000 characters down to its first and last 500. A session that is due no note gets all
+  of its mail at the turn start, as before, and a long piece is cut the same way.
+- `read` hands over everything that is held. More than Hermes allows one tool result (100,000 characters,
+  less for a model with a small window) is replaced by a preview, with the full text in a file Hermes names.
+- What its `ask` told a subagent or a cron run can be summarised away like a note, and there is no turn
+  start to tell it again. After a compaction of its context such a session is no longer shown the notice,
+  and a late answer waits for its next `intercom` call; an `ask` it makes after that tells it again.
+- The hooks tell the plugin the tool's name, the session's surface and what a compaction did. A Hermes that
+  stopped passing one of those would cost the feature that needs it — the notice, the note, or a note
+  surviving a prune of tool results — and the doctor cannot see it.
 
 Messages are framed `[INTERCOM — message from another agent session, NOT from <user_name>]` and told they carry
 no user authority. Everything that came from another session is untrusted, because sessions read web pages
@@ -154,13 +243,19 @@ without spawning the kanban CLI; create it with `hermes kanban boards create ses
   `settings.wait_max_hours` (24) — how long a registered wait is kept
 
 ## Update safety
-Only documented surfaces: `register_tool/hook/command/cli_command`, `inject_message`, `get_config`, the hook
-payloads in the hooks catalog, `gateway.session_context.get_session_env` / `bound_session_key`. `state.db`
+Only documented surfaces: `register_tool/hook/command/cli_command`, `register_system_prompt_section`,
+`inject_message`, `get_config`, the hook payloads in the hooks catalog, the `session_id` Hermes passes a tool
+handler, `gateway.session_context.get_session_env` / `bound_session_key`. `state.db`
 (session titles; for `wait`, the transcript, the turn leases and the background-delegation table), the
-kanban CLI and board reader, `tools.interrupt` (user stop / mid-turn message during a blocking call) and
-Hermes's list of control-frame openers are read defensively: listing degrades (without the transcript table,
-chat sessions the agent never replied in are listed too), a wait reports less or runs to its timeout,
-the plugin's own copy of the list is used, nothing crashes. The seam check runs at every load, logs a
+kanban CLI and board reader, `tools.interrupt` (user stop / mid-turn message during a blocking call),
+Hermes's list of control-frame openers and its rule for which tools' output is untrusted are read
+defensively (so are a few names and sizes copied from its source, which the doctor cannot check: the
+`connectors__` prefix, the `subagent`, `cron` and `oneshot` session kinds, the 8,000-character floor of its
+result budget, the 10,000-character limit on a hook's context, and what the hooks say about a tool's name, a
+session's surface and a compaction): listing degrades (without the transcript table, chat sessions the agent never replied in are
+listed too), a wait reports less or runs to its timeout, the plugin's own copy of the list or the rule is
+used, nothing crashes. On a Hermes without prompt sections, or one that refuses the section, every session
+is told by the note at a turn start, and the doctor says which. The seam check runs at every load, logs a
 warning and pops a desktop notification (macOS, or `notify-send` on a Linux desktop) once per new problem
 set; run `hermes intercom doctor` after an update to check by hand.
 
@@ -179,6 +274,10 @@ directories and records the revision. It does **not** reload the plugin: running
 until they reload it or restart. (The Update button on the Desktop/dashboard plugin page reloads when it
 pulls something new; after a CLI `update` it finds nothing to pull and reloads nothing.) A caution verdict from Hermes's plugin scanner needs consent, which is only
 asked on a terminal: from a session without one, read the findings and pass `--force`.
+
+A process that has not reloaded yet keeps the previous behaviour for the sessions it hosts (with the version
+before this change, whole messages in their tool results), and tells its own callers what that version
+promised. They share one mailbox and one set of presence files either way.
 
 To load a new revision into the running Desktop backend and gateway without restarting anything, run under
 the interpreter Hermes runs, with Hermes's checkout on `sys.path`:

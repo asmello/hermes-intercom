@@ -1,6 +1,6 @@
 name: intercom
-version: 0.2.0
-description: "Session-to-session messaging and sequencing for local Hermes sessions (CLI/TUI/Desktop): discover live peers, send messages, ask questions and get replies, wait for another session to yield, plus a watchdog that nudges sessions whose `sessions` kanban card has gone stale. Uses only the public plugin API (register_tool, hooks, inject_message)."
+version: 0.3.0
+description: "Session-to-session messaging and sequencing for local Hermes sessions (CLI/TUI/Desktop): discover live peers, send messages, ask questions and get replies, wait for another session to yield, plus a watchdog that nudges sessions whose `sessions` kanban card has gone stale. Uses only the public plugin API (register_tool, hooks, register_system_prompt_section, inject_message)."
 author: "Andre (asmello) + Hermes"
 provides_tools:
   - intercom
