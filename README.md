@@ -195,6 +195,9 @@ Known limits:
   of its mail at the turn start, as before, and a long piece is cut the same way.
 - `read` hands over everything that is held. More than Hermes allows one tool result (100,000 characters,
   less for a model with a small window) is replaced by a preview, with the full text in a file Hermes names.
+- What its `ask` told a subagent or a cron run can be summarised away like a note, and there is no turn
+  start to tell it again. After a compaction of its context such a session is no longer shown the notice,
+  and a late answer waits for its next `intercom` call; an `ask` it makes after that tells it again.
 - The hooks tell the plugin the tool's name, the session's surface and what a compaction did. A Hermes that
   stopped passing one of those would cost the feature that needs it — the notice, the note, or a note
   surviving a prune of tool results — and the doctor cannot see it.
