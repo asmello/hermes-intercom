@@ -9,6 +9,7 @@ import json
 import sqlite3
 import sys
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -27,6 +28,7 @@ def fake_hermes(**replaced):
         def register_hook(self, name, fn): ...
         def inject_message(self, text, role="user", session_key=""): ...
         def get_config(self, key, default=None): ...
+        def register_system_prompt_section(self, id, content, **kw): ...
 
     interrupt = types.SimpleNamespace(is_interrupted=lambda: False, consume_yield=lambda tid: False)
     config = {"plugins": {"entries": {"intercom": {"allow_gateway_injection": True}}}}
@@ -38,6 +40,7 @@ def fake_hermes(**replaced):
                                                          bound_session_key=lambda: ""),
         "tools.interrupt": interrupt,
         "agent.prompt_builder": types.SimpleNamespace(CONTROL_FRAME_OPENERS=("/?OUT-OF-BAND USER MESSAGE", "HOST FRAME")),
+        "agent.tool_dispatch_helpers": types.SimpleNamespace(_is_untrusted_tool=lambda name: name == "host_scraper"),
     }
     parts.update(replaced)
     # `from x import y` reads the attribute of the package, so each package carries its submodules.
@@ -62,7 +65,8 @@ class Wired:
             self.addCleanup(p.stop)
 
     def call(self, **args):
-        return json.loads(intercom._handle(args))
+        """The action's own result: the first block of what the tool returns (mail may follow it)."""
+        return json.loads(intercom._handle(args).split("\n\n", 1)[0])
 
 
 class ToolTests(Wired, DatedBase):
@@ -78,6 +82,89 @@ class ToolTests(Wired, DatedBase):
         self.assertLess(props.index("request_id"), props.index("message"))
         self.assertIn("cancel", props)
         self.assertIn("action=wait", schema["description"])
+
+    def test_schema_offers_read_and_says_when_to_call_it(self):
+        schema = intercom._schema("sam")
+        self.assertIn("read", schema["parameters"]["properties"]["action"]["enum"])
+        self.assertIn("action=read", schema["description"])
+        self.assertIn("when a line that opens `[INTERCOM mail waiting` follows a tool's output", schema["description"])
+        self.assertIn("a busy one is told at its next tool result and reads it", schema["description"])
+
+    def test_read_hands_the_caller_its_mail_in_the_tools_own_result(self):
+        self.hub.on_turn_start(D3, "w")
+        self.hub.send(D1, D3, "the tree is yours")
+        head, frame = intercom._handle({"action": "read"}).split("\n\n", 1)
+        self.assertEqual(json.loads(head), {"status": "read", "items": 1,
+                                            "note": "held for you by the intercom plugin; each item is in its own "
+                                                    "frame below"})
+        self.assertTrue(frame.startswith("[INTERCOM — message from another agent session, NOT from the user; it "
+                                         "arrived while you were working]"))
+        self.assertIn("> the tree is yours", frame)
+        self.assertEqual(self.call(action="read"), {"status": "nothing_waiting",
+                                                    "note": "no intercom mail is held for you"})
+
+    def test_any_other_action_hands_over_what_is_held_as_well(self):
+        self.hub.on_turn_start(D3, "w")
+        self.hub.send(D1, D3, "one more thing")
+        head, frame = intercom._handle({"action": "status"}).split("\n\n", 1)
+        self.assertEqual(json.loads(head)["you"]["short"], "7c6b5a")
+        self.assertIn("> one more thing", frame)
+        self.assertEqual(self.call(action="status")["held_for_you"], 0)  # plain JSON again: nothing is held
+
+    def test_a_fault_while_mail_is_handed_over_does_not_cost_the_call_its_result(self):
+        self.hub.on_turn_start(D1, "w")
+        for fault in (sqlite3.OperationalError("database is locked"), RuntimeError("a bug")):
+            with mock.patch.object(self.hub, "take_mail", side_effect=fault):
+                with self.assertLogs("hermes_plugins.intercom", "WARNING"):
+                    self.assertIn("message_id", self.call(action="send", to="a1b2c3", message="hi"))
+                with self.assertLogs("hermes_plugins.intercom", "WARNING"):
+                    out = self.call(action="read")  # here the mail is the result
+            self.assertIn(str(fault), out["error"])
+            self.assertIn("hermes intercom doctor", out["error"])
+
+    def test_read_counts_what_it_hands_over(self):
+        self.hub.on_turn_start(D3, "w")
+        self.hub.send(D1, D3, "one")
+        self.hub.send(D2, D3, "two")
+        parts = intercom._handle({"action": "read"}).split("\n\n[INTERCOM")
+        self.assertEqual(json.loads(parts[0])["items"], 2)
+        self.assertEqual(len(parts), 3)
+
+    def test_read_says_so_when_it_could_not_look(self):
+        self.hub.on_turn_start(D3, "w")
+        self.hub.send(D1, D3, "ping")
+        with mock.patch.object(self.hub, "_stopped", lambda: True):
+            out = self.call(action="read")
+        self.assertEqual(out["status"], "interrupted")
+        self.assertIn("stays held", out["note"])
+        with mock.patch.object(intercom, "_caller_id", lambda: ""):
+            self.assertIn("needs a calling session", self.call(action="read")["error"])
+        with mock.patch.object(self.hub.store, "held_targets", side_effect=sqlite3.OperationalError("locked")):
+            self.hub._bump()  # no snapshot to go by: a read looks in the mailbox itself
+            self.assertEqual(json.loads(intercom._handle({"action": "read"}).split("\n\n", 1)[0])["status"], "read")
+
+    def test_what_arrives_while_a_call_waits_is_handed_over_with_its_result(self):
+        self.hub.on_turn_start(D1, "w")
+        self.hub.on_turn_start(D3, "w")
+        result = {}
+        t = threading.Thread(daemon=True, target=lambda: result.update(
+            out=intercom._handle({"action": "wait", "to": "a1b2c3", "timeout_s": 30})))
+        t.start()
+        self.threads.append(t)
+        for _ in range(200):
+            if self.hub.store.waits(waiter_id=D3):
+                break
+            time.sleep(0.02)
+        self.hub.send(D2, D3, "the tree is yours")
+        t.join(10)
+        head, frame = result["out"].split("\n\n", 1)
+        self.assertEqual(json.loads(head)["status"], "message_arrived")
+        self.assertIn("> the tree is yours", frame)
+
+    def test_no_action_works_in_a_process_where_the_plugin_is_not_loaded(self):
+        with mock.patch.object(intercom, "_hub", None):
+            for action in ("read", "status"):
+                self.assertIn("not initialised", self.call(action=action)["error"])
 
     def test_list_shows_distinct_short_ids_and_who_waits_for_whom(self):
         self.hub.on_turn_start(D1, "w")
@@ -211,6 +298,15 @@ class HookTests(Wired, Base):
         intercom._post_compaction(session_id=B)  # compacted in place: Hermes names no old id
         self.assertTrue(self.hub.hosts("local-bbbb3333"))
 
+    def test_the_compaction_hook_says_what_kind_of_compaction_it_was(self):
+        self.hub.on_turn_start(B, "w", platform="local")
+        self.hub.send(A, B, "ping")
+        intercom._post_compaction(session_id=B, kind="prune_tool_results", reason="proactive_prune")
+        self.assertIsNotNone(self.hub.on_tool_result(B, "r", "terminal"))  # its note is still in a user turn
+        self.now += 61
+        intercom._post_compaction(session_id=B, kind="summarize", reason="threshold")
+        self.assertIsNone(self.hub.on_tool_result(B, "r", "terminal"))
+
     def test_blocking_calls_see_the_users_stop_and_steer(self):
         state = {"stop": False, "steer": set()}
         fake = types.SimpleNamespace(
@@ -229,6 +325,34 @@ class HookTests(Wired, Base):
         with mock.patch.dict(sys.modules, {"tools": None, "tools.interrupt": None}):
             self.assertEqual(intercom._interrupted(), "")
 
+    def test_a_stop_is_seen_without_taking_the_users_mid_turn_message(self):
+        me = threading.current_thread().ident
+        state = {"stop": False, "steer": {me}}
+        fake = types.SimpleNamespace(
+            is_interrupted=lambda: state["stop"],
+            consume_yield=lambda tid: tid in state["steer"] and not state["steer"].discard(tid))
+        with mock.patch.dict(sys.modules, {"tools": types.SimpleNamespace(interrupt=fake), "tools.interrupt": fake}):
+            self.assertIs(intercom._stopped(), False)
+            state["stop"] = True
+            self.assertIs(intercom._stopped(), True)
+        self.assertEqual(state["steer"], {me})  # still there for the call that blocks
+        with mock.patch.dict(sys.modules, {"tools": None, "tools.interrupt": None}):
+            self.assertIs(intercom._stopped(), False)
+
+    def test_the_tool_result_hook_says_which_tool_the_result_is_from(self):
+        self.hub.on_turn_start(B, "w", platform="local")
+        self.hub.send(A, B, "ping")
+        self.assertIsNone(intercom._transform_tool_result(tool_name="web_extract", result="a page", session_id=B))
+        out = intercom._transform_tool_result(tool_name="terminal", result="ok", session_id=B, duration_ms=3)
+        self.assertTrue(out.startswith("ok\n\n[INTERCOM mail waiting"))
+
+    def test_hermes_is_asked_how_it_treats_a_tools_output(self):
+        self.assertIs(intercom._untrusted_output("host_scraper"), True)
+        self.assertIs(intercom._untrusted_output("terminal"), False)
+        with mock.patch.dict(sys.modules, {"agent.tool_dispatch_helpers": types.SimpleNamespace()}):
+            with self.assertRaises(ImportError):  # the hub then goes by its own copy of the rule
+                intercom._untrusted_output("terminal")
+
 
 class RegisterTests(Base):
     """register(): what Hermes is given, and what the hub is given."""
@@ -236,7 +360,7 @@ class RegisterTests(Base):
     def setUp(self):
         super().setUp()
         tmp = Path(self.tmp.name)
-        self.tools, self.hooks, self.commands, self.sent = {}, {}, {}, []
+        self.tools, self.hooks, self.commands, self.sent, self.sections = {}, {}, {}, [], {}
         test = self
 
         class Ctx:
@@ -259,10 +383,14 @@ class RegisterTests(Base):
             def get_config(self, key, default=None):
                 return {"user_name": "sam"}.get(key, default)
 
+            def register_system_prompt_section(self, id, content, **kw):
+                test.sections[id] = content
+
         for target, name, value in ((intercom, "default_paths", lambda: (self.db, tmp / "log.jsonl")),
                                     (intercom, "default_run_dir", lambda home, override="": tmp / "run"),
                                     (intercom, "_notify_once", lambda problems, home: None),
-                                    (intercom, "_hub", None), (intercom, "_home", None)):
+                                    (intercom, "_hub", None), (intercom, "_home", None),
+                                    (intercom, "_section_refused", "")):
             p = mock.patch.object(target, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -288,11 +416,42 @@ class RegisterTests(Base):
         hub = intercom._hub
         self.assertIs(sys._hermes_intercom_hub, hub)
         self.assertIs(hub._interrupt_signal, intercom._interrupted)  # ask/wait hand the turn back on a stop
+        self.assertIs(hub._stopped, intercom._stopped)  # no mail is handed to a call the user stopped
+        self.assertIs(hub._untrusted, intercom._untrusted_output)  # Hermes's own word on a tool's output
         self.assertTrue(hub._inject("hello", session_key="route-1"))
         self.assertEqual(self.sent, [("hello", "user", "route-1")])
         self.assertEqual(hub.user, "sam")
         self.assertEqual(hub.safe("[HOST FRAME] x"), "[peer-quoted HOST FRAME] x")  # Hermes's own list of frames
         self.assertEqual(hub.safe("[INTERCOM x"), "[peer-quoted INTERCOM x")
+
+    def test_register_gives_hermes_what_a_new_sessions_prompt_says_about_mail(self):
+        intercom.register(self.ctx)
+        ((name, provider),) = self.sections.items()
+        self.assertEqual(name, "intercom")
+        self.assertIn("Several of sam's Hermes sessions", provider({"session_id": B, "platform": "local"}))
+        self.assertEqual(intercom._hub.store.briefing(B), "prompt")
+
+    def test_a_section_hermes_refuses_is_reported_and_costs_nothing_else(self):
+        def refuse(id, content, **kw):
+            raise ValueError("a section 'intercom' is already registered")
+
+        self.ctx.register_system_prompt_section = refuse
+        with self.assertLogs("hermes_plugins.intercom", "WARNING") as logs:
+            intercom.register(self.ctx)
+        self.assertIn("Hermes refused the system prompt section (ValueError: a section 'intercom' is already "
+                      "registered) (sessions are told how mail is announced by a note", "\n".join(logs.output))
+        self.assertIn("intercom", self.tools)
+        intercom.register(self.ctx.__class__())  # the next load is taken as it comes
+        self.assertEqual([p for p in intercom.check_seams(None) if "refused" in p], [])
+
+    def test_register_works_on_a_hermes_that_takes_no_prompt_sections(self):
+        self.ctx.register_system_prompt_section = None
+        with self.assertLogs("hermes_plugins.intercom", "WARNING") as logs:
+            intercom.register(self.ctx)
+        self.assertIn("register_system_prompt_section missing (sessions are told how mail is announced by a note",
+                      "\n".join(logs.output))
+        self.assertNotIn("refused", "\n".join(logs.output))  # nothing was asked of it
+        self.assertIn("intercom", self.tools)
 
     def test_a_reload_keeps_what_the_previous_hub_knew(self):
         intercom.register(self.ctx)
@@ -301,6 +460,55 @@ class RegisterTests(Base):
         intercom.register(self.ctx)
         self.assertIsNot(intercom._hub, first)
         self.assertTrue(intercom._hub.hosts(B))
+
+    def test_after_a_reload_hermes_asks_the_hub_that_is_live(self):
+        intercom.register(self.ctx)
+        self.sections.clear()  # Hermes drops a plugin's sections when it unloads it
+        intercom.register(self.ctx)
+        self.sections["intercom"]({"session_id": B, "platform": "local"})
+        self.assertEqual(intercom._hub.store.briefing(B), "prompt")
+
+    def test_the_turn_start_hook_passes_on_the_surface_hermes_names(self):
+        intercom.register(self.ctx)
+        out = intercom._pre_llm_call(session_id=B, user_message="go", platform="local")
+        self.assertIn("note from Hermes's intercom plugin", out["context"])
+        self.assertEqual(intercom._hub.store.briefing(B), "turn")
+        self.assertIsNone(intercom._pre_llm_call(session_id=B, user_message="go", platform="local"))
+
+    def test_the_session_hermes_names_for_the_call_is_the_one_whose_mail_is_handed_over(self):
+        intercom.register(self.ctx)
+        hub = intercom._hub
+        hub.on_turn_start(B, "w", platform="local")
+        hub.prompt_section({"session_id": B, "platform": "local"})
+        hub.send(A, B, "for B only")
+        with mock.patch.object(intercom, "_caller_id", lambda: ""):  # nothing bound in this context
+            out = intercom._handle({"action": "status"}, session_id=B)
+        self.assertIn("> for B only", out)
+        self.assertEqual(hub.store.held_for(B), [])
+        hub.send(A, B, "again")
+        with mock.patch.object(intercom, "_caller_id", lambda: A):
+            out = intercom._handle({"action": "read"}, session_id=D3)  # and a disagreement hands over nothing
+        self.assertIn("two different sessions", out)
+        self.assertEqual(len(hub.store.held_for(B)), 1)
+
+    def test_a_call_bound_to_two_sessions_hands_over_nothing(self):
+        intercom.register(self.ctx)
+        hub = intercom._hub
+        hub.on_turn_start(B, "w", platform="local")
+        hub.prompt_section({"session_id": B, "platform": "local"})
+        hub.send(A, B, "for B only")
+        with mock.patch.object(intercom, "_caller_id", lambda: B):
+            out = intercom._handle({"action": "status"}, session_id=D3)
+        self.assertIn("two different sessions", out)
+        self.assertNotIn("for B only", out)
+        self.assertEqual(len(hub.store.held_for(B)), 1)
+
+    def test_a_call_the_user_stopped_still_returns_the_action_it_ran(self):
+        intercom.register(self.ctx)
+        with mock.patch.object(intercom._hub, "_stopped", lambda: True), \
+                mock.patch.object(intercom, "_caller_id", lambda: B):
+            out = json.loads(intercom._handle({"action": "status"}))
+        self.assertEqual(out["you"]["session_id"], B)  # the action ran; only the mail is not handed over
 
     def test_register_works_when_hermes_has_no_list_of_control_frames(self):
         with mock.patch.dict(sys.modules, {"agent.prompt_builder": types.SimpleNamespace()}), \
@@ -325,6 +533,12 @@ class SlashTests(Wired, DatedBase):
         rows = intercom._slash("").splitlines()
         self.assertTrue(any(r.startswith("a1b2c3") and "running" in r for r in rows), rows)
         self.assertTrue(any(r.startswith("7c6b5a") and "[waits for a1b2c3]" in r for r in rows), rows)
+
+    def test_slash_takes_nobodys_mail(self):
+        self.hub.on_turn_start(D3, "w")
+        self.hub.send(D1, D3, "for the session, not for whoever types /intercom in it")
+        self.assertIn("a1b2c3", intercom._slash(""))
+        self.assertEqual(len(self.hub.store.held_for(D3)), 1)
 
     def test_slash_says_why_it_lists_nothing(self):
         with mock.patch.object(intercom, "_hub", None):
@@ -391,6 +605,11 @@ class SeamTests(Base):
     def test_doctor_reports_a_list_of_control_frames_it_can_no_longer_read(self):
         self.assertIn("CONTROL_FRAME_OPENERS", self.problems(**{"agent.prompt_builder": types.SimpleNamespace()}))
 
+    def test_doctor_reports_a_hermes_that_cannot_be_asked_about_untrusted_output(self):
+        for broken in (types.SimpleNamespace(), types.SimpleNamespace(_is_untrusted_tool=None)):
+            self.assertIn("the plugin's own copy of Hermes's list of tools whose output is untrusted",
+                          self.problems(**{"agent.tool_dispatch_helpers": broken}))
+
     def test_doctor_reports_injection_that_is_not_allowed(self):
         off = types.SimpleNamespace(load_config=lambda: {"plugins": {"entries": {"intercom": {}}}})
         self.assertIn("allow_gateway_injection", self.problems(**{"hermes_cli.config": off}))
@@ -407,9 +626,30 @@ class SeamTests(Base):
 
         self.assertEqual(run()[0], 0)
         self.assertIn("all seams OK", run()[1])
+        self.assertIn("prompt section", run()[1])
+        self.assertIn("untrusted-output rule", run()[1])
         code, text = run(**{"agent.prompt_builder": types.SimpleNamespace()})
         self.assertEqual(code, 1)
         self.assertIn("CONTROL_FRAME_OPENERS", text)
+
+    def test_the_doctor_command_reports_a_hermes_that_takes_no_prompt_sections(self):
+        tmp = Path(self.tmp.name)
+
+        class OlderContext:
+            def register_tool(self, **kw): ...
+            def register_hook(self, name, fn): ...
+            def inject_message(self, text, role="user", session_key=""): ...
+            def get_config(self, key, default=None): ...
+
+        older = types.SimpleNamespace(VALID_HOOKS=set(intercom.HOOKS), PluginContext=OlderContext)
+        out = io.StringIO()
+        with mock.patch.object(intercom, "default_paths", lambda: (self.db, tmp / "log.jsonl")), \
+                mock.patch.object(intercom, "default_run_dir", lambda home, override="": tmp / "run"), \
+                mock.patch.dict(sys.modules, fake_hermes(**{"hermes_cli.plugins": older})), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(intercom._doctor(), 1)
+        self.assertIn("PluginContext.register_system_prompt_section missing (sessions are told how mail is "
+                      "announced by a note at a turn start, not by their system prompt)", out.getvalue())
 
 
 if __name__ == "__main__":
