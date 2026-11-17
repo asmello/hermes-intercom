@@ -56,10 +56,11 @@ for a session whose prompt predates that, in a note at a turn start. The mailbox
 records who was told and how (table ``briefings``); any other running session gets its
 mail when its turn ends. The record says the text was handed over, not that it arrived:
 a session that is shown the notice and lets its turn end without reading stops counting
-as told (``DOUBTED``), and is told again by a note. A session no host can start a turn
-in (a subagent, a cron run, a one-shot run) is told by neither prompt nor note; its
-only mail is the late answer to its own ``ask``, whose result tells it how that answer
-will be announced, and nothing is ever given to a host to start a turn with.
+as told (``DOUBTED``), and is told again by a note. A subagent and a cron run are told
+by neither prompt nor note; their only mail is the late answer to their own ``ask``,
+whose result tells them how that answer will be announced. No host can start a turn in
+either, nor in a one-shot run (which its prompt tells): mail for one is never given to
+a host to start a turn with, and stays held for the session's own intercom call.
 
 Text from other sessions (bodies, titles, prompts, quoted transcripts) is
 untrusted: it is shown through ``Hub.safe`` / ``line`` / ``_quote`` only.
@@ -132,7 +133,6 @@ HANDBACK_S = 20  # how long after Hermes accepted a background result the turn i
 RETENTION_S = 7 * 86400
 TOMBSTONE_S = 86400  # how long the record of a closed session is kept for other processes
 ID_CHUNK = 500  # ids per state.db query: well under SQLite's bound-parameter limit
-FINAL = ("confirmed", "delivered_turn_start", "delivered_mid_turn")
 UNFINISHED = ("interrupted", "failed", "incomplete")  # ways a turn ends that may leave its work undone
 # state.db beyond the session list, read by `wait` (and checked by `hermes intercom doctor`):
 TRANSCRIPT_COLUMNS = ("id", "session_id", "role", "content", "timestamp")  # table `messages`
@@ -755,7 +755,7 @@ class Hub:
     # ------------------------------------------------------------------ text from other sessions
     # A session may be reading a web page or a mailbox, so anything it wrote (a message, a title, a
     # prompt, its last answer) can carry text meant to pass for the user, for Hermes or for this plugin.
-    # Everything shown to another session goes through one of these three.
+    # Everything shown to another session goes through one of these.
     def safe(self, text) -> str:
         """*text* with every control-frame opener relabelled."""
         return self._frames.sub(RELABEL, str(text or ""))
@@ -2080,9 +2080,9 @@ class Hub:
     def _answer_held(self, caller: str) -> str:
         """What `ask` tells a caller no host can start a turn in about an answer that comes after
         the call ("" for any other caller: the answer starts a turn in it, note and all). Neither
-        its prompt nor its turns can tell such a session how mail is announced (a subagent, a cron
-        run and a one-shot run get neither section nor note), so its own call tells it, and from
-        then on it counts as told."""
+        its prompt nor its turns tell a subagent or a cron run how mail is announced (they get
+        neither section nor note), so its own call tells it, and from then on it counts as told.
+        A one-shot run was told by its prompt, and is left to that."""
         if self._startable(self.peer(caller)) is not False or self._briefed(caller):
             return ""
         lead = "An answer that comes later is held for you"
@@ -2635,7 +2635,9 @@ class Hub:
 
     def _wakeable(self, session_id: str) -> bool:
         """Can a message start a turn in this session later? Not in a subagent (it returns to its
-        parent and is gone) nor on surfaces nobody can target (cron runs)."""
+        parent and is gone) nor on surfaces nobody can target (cron runs). `wait` asks this of its
+        own caller, from what the hooks said of it; `_startable` is asked of a target before a
+        host is given its mail, from Hermes's record of what kind of session it is."""
         with self._lock:
             if session_id in self._hidden:
                 return False

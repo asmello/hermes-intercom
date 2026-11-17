@@ -147,13 +147,15 @@ about it where it trusts what it reads:
   prompt has the section by then (Hermes asks for the section again when it builds a prompt again);
 - a session that was not told (its turn began before the plugin was loaded or updated) is shown nothing and
   gets its mail when the turn ends, as a new turn;
-- a session no host can start a turn in — a subagent, a cron run, a one-shot run — gets neither section nor
-  note, and nobody can write to it. The one mail it can get is the late answer to a question it asked
-  itself, and the result of that `ask` tells it how the answer will be announced. Its mail is never given
-  to a host, not when it is sent, not when its turn ends, not by a poller: a host asked to start a session
-  by a key it does not know may take the mail and drop it. It waits for the session's own `intercom` call.
-  What kind of session it is comes from Hermes's own record; while that cannot be read, nothing is started
-  in it either and the question is put again at the next poll.
+- a subagent and a cron run get neither section nor note, and nobody can write to them. The one mail such a
+  session can get is the late answer to a question it asked itself, and the result of that `ask` tells it
+  how the answer will be announced;
+- no host can start a turn in a subagent, a cron run or a one-shot run (`hermes chat -q`, which is told by
+  its prompt like any CLI session). Mail for one is never given to a host, not when it is sent, not when
+  its turn ends, not by a poller: a host asked to start a session by a key it does not know may take the
+  mail and drop it. It waits for the session's own `intercom` call. What kind of session it is comes from
+  Hermes's own record; while that cannot be read, nothing is started in it either and the question is put
+  again at the next poll.
 
 The mailbox records who was told and how (table `briefings`: `prompt`, `turn`, `call`, or `doubted`; a
 record goes a week after it was last written, and the record of a session at work is renewed once a day).
